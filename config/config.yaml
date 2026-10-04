@@ -98,3 +98,10 @@ synthetic:              # evaluation/synthetic_recovery.py: recovery of known we
   seed: 0
   device: gpu
   output_dir: null      # null = output/synthetic_<timestamp>
+  sim_chunk: 8          # windows simulated per compiled call (memory per call; progress bar per chunk)
+  resources:            # evaluation/resources.py: keep the workstation responsive
+    max_ram_gb: null    # stop the run above this process RAM; null = max_ram_fraction of the physical RAM
+    max_ram_fraction: 0.4
+    min_available_gb: 3.0  # stop the run when the system's available RAM falls below this (before it swaps)
+    free_cpus: 4        # cores left to the rest of the system (CPU affinity)
+    nice: 10            # lower scheduling priority
