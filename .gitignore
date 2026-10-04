@@ -162,5 +162,9 @@ cython_debug/
 
 # Results
 output/
+
 # JAX persistent compilation cache
 jax_cache/
+
+# Claude
+.claude/

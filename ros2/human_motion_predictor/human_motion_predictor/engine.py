@@ -17,12 +17,17 @@ Requests: {"op": "init", **config} -> {"ok": True, "compile_s"}; {"op": "predict
 """
 
 import json
+import os
 import struct
 import sys
 import time
 from typing import Dict, List
 
-import numpy as np
+# Single-threaded OpenBLAS (LAPACK of JAX's CPU linear algebra): with its thread pool the small factorizations of the
+# prediction were up to 100x slower on a loaded machine. Before numpy is imported.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+import numpy as np  # noqa: E402
 
 COV_KEYS = ("wrist", "elbow", "passive_wrist")
 
@@ -72,9 +77,13 @@ def recv(stream) -> Dict:
 
 # ----------------------------------------------------------------------------- engine
 class Engine:
-    """config: hypotheses [[name, hand, [x, y, z] | None]], params {HumanKinematicParams fields}, H, max_iter,
-    pred_noise, horizon, nominal_duration, stop_time, times (prediction sample times), filter {switch_rate,
-    evidence_lag, temperature, obs_noise}, kappa_heading, kappa_gaze, device, warmup_samples, warmup_dt."""
+    """config: hypotheses [[name, hand, [x, y, z] | None]], params {HumanKinematicParams fields and model switches,
+    params_from_config}, H, max_iter, tol (early stopping of the solver, None = always max_iter), settings
+    {hp.PredictionSettings fields: covariance, residual, observability, temperature, belief_steps} (default: model
+    covariance, fully observed), pred_noise (random-walk covariance only; None = the model covariance), grasp_offset
+    (m, wrist goal before the goal locations, hp.wrist_goal; default 0), horizon, nominal_duration, stop_time, times
+    (prediction sample times), filter {switch_rate, evidence_lag, temperature, obs_noise}, kappa_heading,
+    kappa_gaze, device, warmup_samples, warmup_dt."""
 
     def __init__(self, config: Dict):
         import jax
@@ -84,14 +93,16 @@ class Engine:
         except RuntimeError:
             self.device = jax.devices()[0].platform
         from prophet_ioc import human_prediction as hp
-        from prophet_ioc.envs.human_kinematic_reaching import HumanKinematicParams
+        from prophet_ioc.envs.human_kinematic_reaching import params_from_config
         self.hp, self.c = hp, config
-        self.params = HumanKinematicParams(**{k: float(v) for k, v in config["params"].items()
-                                              if k in HumanKinematicParams._fields})
+        self.params = params_from_config(config["params"])
+        self.settings = hp.PredictionSettings(**(config.get("settings") or {}))
+        self.pred_noise = None if config.get("pred_noise") is None or not self.settings.random_walk \
+            else float(config["pred_noise"])
         self.hypotheses = [hp.Hypothesis(n, h, None if g is None else tuple(float(x) for x in g))
                            for n, h, g in config["hypotheses"]]
         f = config["filter"]
-        self.filter = hp.GoalFilter(self.hypotheses, config["pred_noise"], switch_rate=f["switch_rate"],
+        self.filter = hp.GoalFilter(self.hypotheses, self.pred_noise, switch_rate=f["switch_rate"],
                                     evidence_lag=f["evidence_lag"], temperature=f["temperature"],
                                     obs_noise=f["obs_noise"])
         self.times = np.asarray(config["times"], dtype=float)
@@ -124,7 +135,8 @@ class Engine:
                                           np.asarray(req["body"], dtype=np.float32), self.hypotheses, self.params,
                                           int(c["H"]), int(c["max_iter"]), horizon=float(c["horizon"]),
                                           nominal_duration=float(c["nominal_duration"]),
-                                          stop_time=float(c["stop_time"]))
+                                          stop_time=float(c["stop_time"]), tol=c.get("tol"), settings=self.settings,
+                                          grasp_offset=float(c.get("grasp_offset", 0.0)))
         head = None if req.get("head") is None else np.asarray(req["head"], dtype=float)
         gaze = None if req.get("gaze") is None else np.asarray(req["gaze"], dtype=float)
         log_prior = hp.goal_cue_logprior(self.hypotheses, hs, head, gaze, float(c["kappa_heading"]),
@@ -132,7 +144,7 @@ class Engine:
         post = self.filter.update(float(req["t"]), preds, log_prior)
         joints, covs = [], []
         for p in preds:
-            j, cv = hp.sample_prediction(p.prediction, self.times, float(c["pred_noise"]))
+            j, cv = hp.sample_prediction(p.prediction, self.times, self.pred_noise)
             joints.append(np.stack([j[name] for name in hp.JOINTS], axis=1))
             covs.append(np.stack([cv[k] for k in COV_KEYS], axis=1))
         joints, covs = np.stack(joints), np.stack(covs)

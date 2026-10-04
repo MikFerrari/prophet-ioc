@@ -107,7 +107,7 @@ def test_task_jacobians_and_finite_differences():
 def test_ilqg_reaching_convergence():
     """Verify that gILQR successfully drives the upper body to reach a 3D target."""
     env = HumanKinematicReaching(mode="upper_body")
-    params = HumanKinematicParams(action_cost=1e-4, velocity_cost=1e-2, motor_noise=0.1, obs_noise=1.0)
+    params = HumanKinematicParams(motor_noise=0.1, obs_noise=1.0)   # default cost weights
 
     H = 25
     u_init = jnp.zeros((H, env.n_dof), dtype=jnp.float32)

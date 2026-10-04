@@ -3,6 +3,11 @@
 # eval.py predicts the reaches of the held-out test subjects from each observed fraction in obs_ratios.
 subjects: [sub_3, sub_4, sub_6, sub_7, sub_8, sub_9, sub_10, sub_11, sub_12, sub_13]
 test_subjects: [sub_13]          # held out: never seen by train.py
-instructions: [0, 1, 2, 3, 4, 5, 6, 7, 8]   # 1, 3, 5 reach objects; 7 reach the robot (both hands); 0, 2, 4, 6, 8 hands home
-velocity: FAST                   # FAST | MEDIUM | SLOW
-obs_ratios: [0.1, 0.3, 0.5, 0.7]
+instructions: [1, 3, 5]                   # single-hand reaches to objects (1: right, 3: left, 5: right cross-reach)
+velocities: [SLOW, MEDIUM, FAST]  # list of velocities (e.g. [SLOW, MEDIUM, FAST]) or single string
+obs_ratios: [0.2, 0.5, 0.7]
+state_estimator: rts             # joint positions / velocities of the training windows: rts (Rauch-Tung-Striebel
+                                 # smoother under the model's ZOH dynamics, consistent with the model) | savgol
+                                 # (Savitzky-Golay, window of the dataset's preprocessing)
+rts_accel_noise: 10.0            # rts: white-noise acceleration intensity (rad/s^2/sqrt(s); m for the pelvis)
+rts_obs_noise: 0.005             # rts: noise of the IK joint angles (rad; m for the pelvis)

@@ -360,3 +360,86 @@ def sg_upper_body_state(
     q = savgol_filter(q_raw, w, order, deriv=0, axis=0, mode="interp")
     qd = savgol_filter(q_raw, w, order, deriv=1, delta=trial.dt, axis=0, mode="interp")
     return q.astype(np.float32), qd.astype(np.float32)
+
+
+def rts_smooth(
+    y: np.ndarray,
+    dt: float,
+    accel_noise: float,
+    obs_noise: float,
+    damping: float = 0.0,
+    vel0_std: float = 1.0,
+    pos0_std: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Rauch-Tung-Striebel (Kalman) smoother of position measurements y (N, m) under the model's dynamics.
+
+    Each column is an independent joint with state [q, qd] following the exact ZOH damped double integrator of
+    HumanKinematicReaching (prophet_ioc.envs.zoh, damping b) driven by a white-noise acceleration of intensity
+    accel_noise (random-acceleration model: process covariance accel_noise^2 M(dt)), observed as y = q + noise with
+    std obs_noise. Forward Kalman filter, then the RTS backward pass: the estimates use all samples, and positions and
+    velocities are consistent with the dynamics of the model (unlike a Savitzky-Golay derivative). NaN measurements
+    are skipped (prediction only). The prior at the first sample is q ~ N(y_0, pos0_std^2) (default pos0_std =
+    obs_noise), qd ~ N(0, vel0_std^2).
+
+    Returns q, qd (N, m), float64.
+    """
+    from prophet_ioc.envs.zoh import zoh_noise_cov, zoh_state_matrices
+
+    y = np.asarray(y, dtype=np.float64)
+    N, m = y.shape
+    A, _ = zoh_state_matrices(float(dt), float(damping), 1, xp=np)          # (2, 2) per joint
+    Q = accel_noise ** 2 * zoh_noise_cov(float(dt), xp=np)
+    R = obs_noise ** 2
+
+    x_f = np.zeros((N, m, 2))
+    P_f = np.zeros((N, m, 2, 2))
+    x_p = np.zeros((N, m, 2))
+    P_p = np.zeros((N, m, 2, 2))
+    x = np.stack([np.nan_to_num(y[0]), np.zeros(m)], axis=1)
+    P = np.broadcast_to(np.diag([R if pos0_std is None else pos0_std ** 2, vel0_std ** 2]), (m, 2, 2)).copy()
+    for k in range(N):
+        if k > 0:
+            x = x @ A.T
+            P = A @ P @ A.T + Q
+        x_p[k], P_p[k] = x, P
+        ok = np.isfinite(y[k])
+        S = P[:, 0, 0] + R
+        K = P[:, :, 0] / S[:, None]                                          # (m, 2)
+        innov = np.where(ok, y[k] - x[:, 0], 0.0)
+        x = x + K * innov[:, None]
+        P = np.where(ok[:, None, None], P - K[:, :, None] * K[:, None, :] * S[:, None, None], P)
+        x_f[k], P_f[k] = x, P
+
+    xs, Ps = x_f[-1].copy(), P_f[-1].copy()
+    out = np.zeros((N, m, 2))
+    out[-1] = xs
+    for k in range(N - 2, -1, -1):
+        G = P_f[k] @ A.T @ np.linalg.inv(P_p[k + 1])                        # (m, 2, 2)
+        xs = x_f[k] + np.einsum("mij,mj->mi", G, xs - x_p[k + 1])
+        Ps = P_f[k] + G @ (Ps - P_p[k + 1]) @ np.swapaxes(G, 1, 2)
+        out[k] = xs
+    return out[:, :, 0], out[:, :, 1]
+
+
+# RTS smoother of the training states (data.state_estimator = rts): white-noise acceleration intensity (rad/s^2/sqrt(s),
+# m/s^2/sqrt(s) for the pelvis) and IK joint-angle noise (rad, m)
+RTS_ACCEL_NOISE = 10.0
+RTS_OBS_NOISE = 0.005
+
+
+def rts_upper_body_state(
+    trial: "CariTrial",
+    q_chest_ref: np.ndarray,
+    end: Optional[int] = None,
+    accel_noise: float = RTS_ACCEL_NOISE,
+    obs_noise: float = RTS_OBS_NOISE,
+    damping: float = 0.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """RTS-smoothed joint positions and velocities (19 DOFs) of frames [0, end] (rts_smooth on the raw IK output
+    q28_raw mapped to the 19 DOFs, chest rotation vector relative to q_chest_ref), under the model's ZOH dynamics with
+    damping b: the alternative to sg_upper_body_state that is consistent with the model. With `end`, only the frames
+    up to `end` are used."""
+    end = len(trial.q28_raw) - 1 if end is None else end
+    q_raw = upper_body_dofs(trial.q28_raw[: end + 1], trial.body_params, q_chest_ref).astype(np.float64)
+    q, qd = rts_smooth(q_raw, trial.dt, accel_noise, obs_noise, damping)
+    return q.astype(np.float32), qd.astype(np.float32)

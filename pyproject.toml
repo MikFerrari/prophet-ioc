@@ -38,6 +38,8 @@ dependencies = [
 cuda = ["jax[cuda13]"]
 # tests, plus what ../human_kinematic_model needs for its binding build and tests
 dev = ["pytest >= 7", "pybind11 >= 2.10", "sympy"]
+# experiment tracking of train.py / eval.py (config wandb): pip install -e ".[tracking]"
+tracking = ["wandb"]
 
 # human_kinematic_model_jax (../human_kinematic_model/scripts) is not a pip package: it is put on sys.path by
 # human_kinematic_model.pth in the venv's site-packages (see README). kimodo/torch (evaluation/kimodo_reaches.py

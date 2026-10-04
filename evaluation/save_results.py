@@ -12,18 +12,14 @@ from typing import Dict, List
 
 import numpy as np
 
-# (key, label, lower is better: True / False, None = not ranked)
+# (key, label, lower is better: True / False, None = not ranked); errors in cm only (the relative errors *_pct
+# of eval.py stay in results.json)
 METRICS = [
     ("mpjpe_cm", "MPJPE (cm)", True),
-    ("mpjpe_pct", "MPJPE (%)", True),
     ("wrist_ade_cm", "Wrist ADE (cm)", True),
-    ("wrist_ade_pct", "Wrist ADE (%)", True),
     ("wrist_fde_cm", "Wrist FDE (cm)", True),
-    ("wrist_fde_pct", "Wrist FDE (%)", True),
     ("elbow_ade_cm", "Elbow ADE (cm)", True),
-    ("elbow_ade_pct", "Elbow ADE (%)", True),
     ("elbow_fde_cm", "Elbow FDE (cm)", True),
-    ("elbow_fde_pct", "Elbow FDE (%)", True),
     ("bone_distortion_pct", "Max bone distortion (%)", True),
     ("coverage_wrist_pct", "95% coverage wrist (%)", None),
     ("coverage_elbow_pct", "95% coverage elbow (%)", None),
@@ -32,7 +28,8 @@ METRICS = [
 ]
 METHODS = [("kin", "Kinematic model, IOC-fitted"), ("kin_init", "Kinematic model, initial weights"),
            ("cart", "Cartesian Multi-Point"), ("minjerk", "Flash & Hogan Min-Jerk"),
-           ("gcv", "Goal-Directed Const. Vel."), ("cv", "Savitzky-Golay Const. Vel.")]
+           ("gcv", "Goal-Directed Const. Vel."), ("cv", "Savitzky-Golay Const. Vel."),
+           ("promp", "ProMP (learned)"), ("dmp", "DMP (learned)")]   # promp, dmp: eval.baselines
 
 
 def summarize(rows: List[Dict]) -> Dict[str, Dict[str, Dict[str, float]]]:
@@ -66,6 +63,8 @@ def table_html(summary: Dict) -> str:
     head = "".join(f"<th>{label}</th>" for _, label, _ in METRICS)
     body = []
     for m, label in METHODS:
+        if not summary.get(m):   # method not evaluated (e.g. eval.baselines: [])
+            continue
         cells = []
         for key, _, _ in METRICS:
             s = summary[m].get(key)
@@ -95,10 +94,9 @@ _STYLE = """<style>
 </style>"""
 
 NOTES = """<p>Mean ± std over the trials; best method per metric in <b>bold</b>. Only the reaching wrist has a goal (the
-target); every method predicts all 9 joints. Percentages: error relative to each keypoint's remaining distance, from its
-position at the first predicted step to its final position (the target for the reaching wrist), at least 2 cm; MPJPE (%)
-averages them over the 9 joints. Coverage: fraction of the prediction steps whose ground truth lies in the 95 %
-ellipsoid of the kinematic model (95 % when calibrated). Latency: one complete prediction from the observation window
+target); every method predicts all 9 joints. Coverage: fraction of the prediction steps whose ground truth lies in the 95 %
+ellipsoid of the kinematic model (95 % when calibrated) or of the ProMP (its own predictive covariance, not
+calibrated). ProMP and DMP are learned from the training subjects' reaches. Latency: one complete prediction from the observation window
 (kinematic model: arrival time, Kalman-filtered handover, gILQR solve, keypoints and covariances), after compilation.</p>"""
 
 
@@ -138,7 +136,7 @@ def save_results(rows: List[Dict], meta: Dict, out_dir: Path) -> Dict[str, Path]
     return paths
 
 
-CONSOLE_METRICS = ["mpjpe_cm", "mpjpe_pct", "wrist_ade_cm", "wrist_fde_cm", "elbow_ade_cm", "bone_distortion_pct",
+CONSOLE_METRICS = ["mpjpe_cm", "wrist_ade_cm", "wrist_fde_cm", "elbow_ade_cm",
                    "latency_ms", "rate_hz"]
 
 
@@ -168,6 +166,8 @@ def print_summary(summary: Dict, keys=CONSOLE_METRICS) -> None:
     best = best_methods(summary)
     print(f"\n{'method':28s}" + "".join(f"{k:>21s}" for k in keys))
     for m, label in METHODS:
+        if not summary.get(m):
+            continue
         cells = []
         for k in keys:
             s = summary[m].get(k)

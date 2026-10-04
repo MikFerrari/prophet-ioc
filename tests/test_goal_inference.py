@@ -54,11 +54,14 @@ def test_env_batch_matches_single_environments():
     targets = np.array([[0.4, -0.2, 1.1], [0.3, 0.3, 1.3]])
     vels = np.array([[0.0, 0.0, 0.0], [0.2, 0.0, 0.1]])
     dts = np.array([0.05, 0.07])
-    batch = hp.reaching_env_batch(BODY, np.zeros(8), x0, q_ref, targets, vels, dts, ["right", "left"], params)
+    batch = hp.reaching_env_batch(BODY, np.zeros(8), x0, q_ref, targets, vels, dts, ["right", "left"])
     U = jnp.zeros((10, 19))
-    L, X, _ = hp._solve_batch(batch, jnp.asarray(x0), U, params, max_iter=10)   # converged: float32 rounding
+    settings = hp.PredictionSettings(covariance="random_walk")
+    out = hp._predict_batch(batch, jnp.broadcast_to(jnp.asarray(x0), (2, 1, 38)), jnp.zeros((38, 38)), params,
+                            settings, 10, 10)   # converged: float32 rounding
+    X = out["mean"]
     for b in range(2):
-        env = hp.make_reaching_env(BODY, np.zeros(8), x0[:19], q_ref, targets[b], dts[b], ["right", "left"][b], params)
+        env = hp.make_reaching_env(BODY, np.zeros(8), x0[:19], q_ref, targets[b], dts[b], ["right", "left"][b])
         env.target_vel = jnp.asarray(vels[b], dtype=jnp.float32)
         env.x0 = jnp.asarray(x0)
         single = jax.tree.map(lambda leaf, i=b: leaf[i], batch)
@@ -76,7 +79,8 @@ def test_predict_hypotheses_targets():
     hyps = [hp.Hypothesis("near", "right", tuple(wrist + [0.2, 0.0, 0.0])),
             hp.Hypothesis("far", "right", tuple(wrist + [0.6, 0.2, 0.2])),
             hp.Hypothesis("idle", "right")]
-    preds, hs = hp.predict_hypotheses(hist, 1 / 29, BODY, hyps, params, 10, 3, horizon=0.5, nominal_duration=0.9)
+    preds, hs = hp.predict_hypotheses(hist, 1 / 29, BODY, hyps, params, 10, 3, horizon=0.5, nominal_duration=0.9,
+                                      tol=1e-3)
     near, far, idle = preds
     # at rest every reach starts now and takes the nominal duration: beyond the 0.5 s window -> temporary targets on
     # the minimum-jerk path, with its velocity at the end of the window
@@ -88,9 +92,28 @@ def test_predict_hypotheses_targets():
         end = p.prediction.joints["right_wrist"][-1]
         assert np.linalg.norm(end - p.target) < 0.03
     assert not idle.temporary and np.linalg.norm(idle.target - wrist) < 1e-6
-    preds, _ = hp.predict_hypotheses(hist, 1 / 29, BODY, hyps[:1], params, 10, 3, horizon=2.0, nominal_duration=0.9)
+    preds, _ = hp.predict_hypotheses(hist, 1 / 29, BODY, hyps[:1], params, 10, 3, horizon=2.0, nominal_duration=0.9,
+                                     settings=hp.PredictionSettings(covariance="both"))
     assert not preds[0].temporary and np.allclose(preds[0].target, hyps[0].goal)
-    assert set(preds[0].prediction.cov(0.8)) == {"wrist", "elbow", "passive_wrist"}
+    assert set(preds[0].prediction.cov(0.8)) == {"wrist", "elbow", "passive_wrist"}   # random walk
+    assert set(preds[0].prediction.cov()) == {"wrist", "elbow", "passive_wrist"}      # model covariance
+
+
+def test_grasp_offset():
+    """The wrist goal is grasp_offset before the object on the line from the wrist; 0 = the object itself."""
+    wrist, obj = np.array([0.0, 0.0, 1.0]), np.array([0.4, 0.3, 1.0])
+    np.testing.assert_allclose(hp.wrist_goal(obj, wrist, 0.0), obj)
+    np.testing.assert_allclose(hp.wrist_goal(obj, wrist, 0.1), [0.32, 0.24, 1.0], atol=1e-12)
+    np.testing.assert_allclose(hp.wrist_goal(obj, wrist, 1.0), wrist, atol=1e-12)   # within the offset: stay
+    params = HumanKinematicParams()
+    hist = _history()
+    kp = np.asarray(hp._fk_batch(jnp.asarray(hist[-1:]), jnp.asarray(BODY)))[0]
+    w = kp[hp.hkm.KP_INDEX["right_wrist"]]
+    hyp = [hp.Hypothesis("obj", "right", tuple(w + [0.3, 0.0, 0.0]))]
+    preds, _ = hp.predict_hypotheses(hist, 1 / 29, BODY, hyp, params, 10, 3, horizon=2.0, nominal_duration=0.9,
+                                     grasp_offset=0.1)
+    np.testing.assert_allclose(preds[0].goal, w + [0.2, 0.0, 0.0], atol=1e-5)
+    np.testing.assert_allclose(preds[0].target, preds[0].goal)
 
 
 def test_wrist_logdensity_is_student_t():
@@ -108,14 +131,14 @@ def _fake_prediction(name, hand, start, velocity, horizon=1.0, H=10):
     joints[f"{hand}_wrist"] = start + t * velocity
     joints[f"{other}_wrist"] = np.tile([0.0, 0.5, 1.0], (H + 1, 1))
     cov = {k: np.tile(np.eye(3) * 1e-4, (H + 1, 1, 1)) for k in ("wrist", "elbow", "passive_wrist")}
-    pred = hp.KinematicPrediction(joints, cov, {k: np.zeros_like(v) for k, v in cov.items()}, horizon, horizon / H)
+    pred = hp.KinematicPrediction(joints, horizon, horizon / H, cov_model=cov)
     return hp.HypothesisPrediction(hp.Hypothesis(name, hand, (0.0, 0.0, 0.0)), pred, np.zeros(3), np.zeros(3),
                                    horizon, False)
 
 
 def test_goal_filter_follows_the_evidence_and_switches():
     hyps = [hp.Hypothesis("a", "right", (1.0, 0.0, 0.0)), hp.Hypothesis("b", "right", (0.0, 1.0, 0.0))]
-    f = hp.GoalFilter(hyps, pred_noise=0.0, switch_rate=1.0, evidence_lag=0.2, temperature=0.5, obs_noise=0.01)
+    f = hp.GoalFilter(hyps, pred_noise=None, switch_rate=1.0, evidence_lag=0.2, temperature=0.5, obs_noise=0.01)
     rate = 15.0
     pos = np.zeros(3)
     post = None

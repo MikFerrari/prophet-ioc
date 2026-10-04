@@ -45,6 +45,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "evaluation"))
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_FLAGS", "--xla_gpu_enable_triton_gemm=false")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")   # see eval.py
 
 import hydra
 import jax
@@ -88,18 +89,18 @@ GOAL_COLORS = {"object_1": "#2a78d6", "object_2": "#eb6834", "object_3": "#1baf7
 # Model parameters
 # =============================================================================
 def model_parameters(cfg):
-    """(params, pred_noise, source): IOC-fitted weights and prediction noise of a train.py run (online.params; the
-    median of its noise levels over the observed fractions), else the initial weights of config/model."""
+    """(params, pred_noise, source, settings): IOC-fitted weights of a train.py run (online.params) and the
+    prediction settings (ck.predictor_settings: covariance of config/model, observability and temperature of the
+    fit), else the initial weights of config/model. pred_noise: None with the model covariance; random walk: the
+    median of the run's noise levels over the observed fractions (model.pred_noise for the initial weights)."""
     if not cfg.online.params:
-        return ck.model_params(cfg.model), float(cfg.model.pred_noise), "initial weights (config/model)"
-    path = ROOT / cfg.online.params
-    path = path / "params.json" if path.is_dir() else path
-    if not path.exists():
-        raise FileNotFoundError(f"{path} not found: run train.py first, or use online.params=null")
-    data = json.loads(path.read_text())
-    noise = data.get("pred_noise", cfg.model.pred_noise)
-    sigma = float(np.median(list(noise.values()))) if isinstance(noise, dict) else float(noise)
-    return ck.load_params(path), sigma, f"IOC-fitted ({path.relative_to(ROOT)})"
+        settings = ck.predictor_settings(cfg)
+        return ck.model_params(cfg.model), ck.pred_noise_of(settings, None, None, float(cfg.model.pred_noise)), \
+            "initial weights (config/model)", settings
+    params, record, path = ck.load_record(ROOT / cfg.online.params)
+    settings = ck.predictor_settings(cfg, record)
+    return params, ck.pred_noise_of(settings, record, None, float(cfg.model.pred_noise)), \
+        f"IOC-fitted ({path.relative_to(ROOT)})", settings
 
 
 # =============================================================================
@@ -121,10 +122,10 @@ def nominal_durations(subjects, velocity):
     return {s: float(np.median([d for o in subjects if o != s for d in dur[o]] or dur[s])) for s in subjects}
 
 
-def replay_session(S, ocfg, params, H, max_iter, pred_noise, nominal_duration):
+def replay_session(S, ocfg, params, H, max_iter, pred_noise, nominal_duration, tol=None, settings=None):
     """Per tick of the session S (cari_sessions.CariSession): the predictions of every hypothesis over the horizon
-    (joints, wrist covariances), the ground truth, the baselines' errors, the cue terms and what the goal filter
-    needs."""
+    (joints, wrist covariances: pred_noise None = model covariance, settings: hp.PredictionSettings), the ground
+    truth, the baselines' errors, the cue terms and what the goal filter needs."""
     subject = S.subject
     goals = cs.layout_goals(subject)
     hyps = cs.layout_hypotheses(goals)
@@ -157,7 +158,8 @@ def replay_session(S, ocfg, params, H, max_iter, pred_noise, nominal_duration):
         hist = hp.resample_history(stamps, q_src[f - n_win: f + 1], stamps[-1], ocfg.observation_time, ocfg.samples)
         t0 = time.perf_counter()
         preds, hs = hp.predict_hypotheses(hist, dt_s, S.body_params, hyps, params, H, max_iter,
-                                          horizon=ocfg.horizon, nominal_duration=nominal_duration)
+                                          horizon=ocfg.horizon, nominal_duration=nominal_duration, tol=tol,
+                                          settings=settings, grasp_offset=float(ocfg.get("grasp_offset", 0.0)))
         out["latency"][k] = time.perf_counter() - t0
         out["heading"][k] = hp.goal_cue_logprior(hyps, hs, None, None, 1.0, 0.0, V_REF)
         if S.gaze is not None:
@@ -588,8 +590,9 @@ def main(cfg: DictConfig):
     if ocfg.goal_mode not in ("inferred", "known") or ocfg.uncertainty not in ("map", "mixture"):
         raise ValueError("online.goal_mode must be inferred | known, online.uncertainty map | mixture")
     dev = ck.setup_jax(ocfg.device)
-    params, pred_noise, source = model_parameters(cfg)
-    H, max_iter = int(cfg.model.horizon), int(cfg.model.max_iter)
+    params, pred_noise, source, settings = model_parameters(cfg)
+    noise_txt = "model covariance" if pred_noise is None else f"random-walk noise {pred_noise:.3g}"
+    H, max_iter, tol = int(cfg.model.horizon), int(cfg.model.max_iter), hp.solver_tolerance(cfg.model)
     train_subjects, test_subjects = ck.split_subjects(cfg.data)
     subjects = list(dict.fromkeys(train_subjects + test_subjects))
     tag = "" if ocfg.source == "cari" else "_kimodo" + ("_noise" if ocfg.noise else "")
@@ -609,7 +612,8 @@ def main(cfg: DictConfig):
         sessions = []
         with jax.default_device(dev):
             for S in tqdm(list(sources), desc="sessions"):
-                sessions.append(replay_session(S, ocfg, params, H, max_iter, pred_noise, durations[S.subject]))
+                sessions.append(replay_session(S, ocfg, params, H, max_iter, pred_noise, durations[S.subject], tol,
+                                               settings))
         with open(out_dir / "sessions.pkl", "wb") as f:
             pickle.dump((durations, sessions), f)
     LLs = [lagged_loglik(sess) for sess in sessions]
@@ -651,7 +655,8 @@ def main(cfg: DictConfig):
             f"({cfg.data.velocity}; held out: {', '.join(test_subjects)}), {len(latency)} ticks at {ocfg.rate:g} Hz, "
             f"last {ocfg.observation_time:g} s observed ({ocfg.angles} IK angles), {ocfg.horizon:g} s predicted; "
             f"{len(sessions[0]['names'])} hypotheses ({', '.join(_label(sessions[0], i) for i in range(len(sessions[0]['names'])))}). "
-            f"Model: {source}, prediction noise {pred_noise:.3g}. Published prediction: goal {ocfg.goal_mode}, "
+            f"Model: {source}, {settings.observability} observability, {noise_txt}. Published prediction: goal "
+            f"{ocfg.goal_mode}, "
             f"covariance {unc}. Prediction of all hypotheses: median {1000 * np.median(latency):.0f} ms on "
             f"{dev.platform}. Filter settings selected on the training subjects: {settings}.")
     write_html(out_dir / "summary.html", meta, results, cue_rows, figures)
@@ -664,6 +669,7 @@ def main(cfg: DictConfig):
                     w.writerow([title, split, m] + [f"{x:.3f}" for x in v])
     (out_dir / "results.json").write_text(json.dumps({
         "online": OmegaConf.to_container(ocfg, resolve=True), "model": source, "pred_noise": pred_noise,
+        "prediction": dict(vars(settings)),
         "test_subjects": test_subjects, "nominal_duration": durations, "filter_settings": settings,
         "latency_ms_median": 1000 * float(np.median(latency)),
         "cues": {k: {"accuracy_moving": v["accuracy_moving"], "accuracy_rest": v["accuracy_rest"],

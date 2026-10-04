@@ -28,6 +28,9 @@ human_motion_predictor:
     # receding-horizon prediction and goal inference (prophet_ioc.human_prediction)
     nominal_duration: 0.95                              # s, minimum-jerk duration of a reach (CARI v2 FAST: 0.95)
     stop_time: 0.3                                      # s, idle hypothesis: time to come to rest
+    grasp_offset: 0.0                                   # m: goal locations that are object positions (e.g. detected
+                                                        #   objects): the wrist goal is this far before the object on
+                                                        #   the line from the wrist; 0 = the location is the wrist goal
     switch_rate: 0.5                                    # 1/s, rate of goal changes of the filter
     evidence_lag: 0.3                                   # s, evidence: observation vs the prediction made this earlier
     evidence_temperature: 0.25                          # tempering of the evidence (overlapping lag windows)
@@ -39,7 +42,10 @@ human_motion_predictor:
                                                         #   (the images: /opt/jax, numpy 2 + current JAX) or in-process
     model_config: ""                                    # "" = $PROPHET_ROOT/config/model/human_kinematic.yaml
     params_file: ""                                     # train.py params.json (IOC-fitted weights + noise); "" = the
-                                                        #   latest run (output/latest_train), "initial" = config/model
+                                                        #   latest run (output/latest_train), "initial" = config/model.
+                                                        #   Predictive covariance: prediction_covariance of the model
+                                                        #   config (model | random_walk); belief-space prediction if the
+                                                        #   run fitted the partially observed model
     publish_markers: true                               # RViz: predicted trajectories, final posture, 95 % wrist, goals
     publish_hypotheses: true                            # all hypotheses on ~/hypotheses (PredictedMotionHypotheses)
     frame_id: ""                                        # "" = frame of the input

@@ -15,9 +15,9 @@ from human_motion_predictor import engine  # noqa: E402
 
 def _config():
     return {"hypotheses": [["a", "right", [0.45, -0.25, 1.15]], ["b", "left", [0.4, 0.3, 1.2]], ["idle", "right", None]],
-            "params": {"action_cost": 1e-4, "velocity_cost": 1e-2, "posture_cost": 1e-3, "running_vel_cost": 1e-2,
+            "params": {"velocity_cost": 1e-4, "running_vel_cost": 1e-4, "pelvis_displacement_cost": 1.0,
                        "pred_noise": 0.8},
-            "H": 6, "max_iter": 2, "pred_noise": 0.8, "horizon": 0.6, "nominal_duration": 0.9, "stop_time": 0.3,
+            "H": 6, "max_iter": 2, "tol": 1e-3, "pred_noise": 0.8, "horizon": 0.6, "nominal_duration": 0.9, "stop_time": 0.3,
             "times": np.arange(0.0, 0.61, 0.1).tolist(),
             "filter": {"switch_rate": 0.5, "evidence_lag": 0.2, "temperature": 0.5, "obs_noise": 0.01},
             "kappa_heading": 2.0, "kappa_gaze": 1.0, "device": "cpu", "warmup_samples": 12, "warmup_dt": 0.05}

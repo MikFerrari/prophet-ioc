@@ -36,7 +36,9 @@ import threading
 import time
 from pathlib import Path
 
-import numpy as np
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")   # in-process engine: see engine.py (before numpy is imported)
+
+import numpy as np  # noqa: E402
 import rclpy
 import yaml
 from geometry_msgs.msg import Point, PointStamped
@@ -96,6 +98,8 @@ class HumanMotionPredictor(Node):
         self.rate = p("rate", 15.0).value
         self.nominal_duration = p("nominal_duration", 0.95).value     # s, minimum-jerk duration of a reach
         self.stop_time = p("stop_time", 0.3).value                    # s, idle hypothesis: time to come to rest
+        # m: goal locations that are object positions -> wrist goal this far before the object (hp.wrist_goal)
+        self.grasp_offset = p("grasp_offset", 0.0).value
         filter_cfg = {k: p(k, v).value for k, v in (("switch_rate", 0.5), ("evidence_lag", 0.3),
                                                     ("evidence_temperature", 0.25), ("evidence_obs_noise", 0.01))}
         self.kappa_heading = p("kappa_heading", 2.0).value
@@ -118,18 +122,26 @@ class HumanMotionPredictor(Node):
         from prophet_ioc import human_prediction as hp
         self.hp = hp
         cfg = yaml.safe_load(Path(self.model_config or _nioc_root() / "config/model/human_kinematic.yaml").read_text())
-        model_params = {k: v for k, v in cfg.items() if k not in ("horizon", "max_iter", "pred_noise")}
+        # numeric model values (weights, noises, switches); the prediction options are strings
+        model_params = {k: v for k, v in cfg.items() if k not in ("horizon", "max_iter", "pred_noise")
+                        and isinstance(v, (bool, int, float))}
         self.H, self.max_iter, self.pred_noise = int(cfg["horizon"]), int(cfg["max_iter"]), float(cfg["pred_noise"])
+        self.tol = hp.solver_tolerance(cfg)   # early stopping of the prediction solver (model.early_stopping, tol)
+        record = None
         latest = _nioc_root() / "output/latest_train/params.json"
         if not self.params_file and latest.exists():   # default: the IOC-fitted weights of the latest train.py run
             self.params_file = str(latest)
         if self.params_file == "initial":                # the initial weights of config/model
             self.params_file = ""
         if self.params_file:
-            data = json.loads(Path(self.params_file).read_text())
-            model_params = data["params"]
-            noise = data.get("pred_noise", self.pred_noise)   # per observed fraction: their median
+            record = json.loads(Path(self.params_file).read_text())
+            model_params = record["params"]
+            noise = record.get("pred_noise", self.pred_noise)   # per observed fraction: their median
             self.pred_noise = float(np.median(list(noise.values()))) if isinstance(noise, dict) else float(noise)
+        # predictive distribution: covariance option of the model config, observability / temperature of the fit
+        self.settings = hp.prediction_settings(cfg, record)
+        if not self.settings.random_walk:
+            self.pred_noise = None   # the model's own covariance
 
         hands = self.hands = ("right", "left") if self.hand == "auto" else (self.hand,)
         if goal_names:
@@ -149,6 +161,7 @@ class HumanMotionPredictor(Node):
         engine_cfg = {
             "hypotheses": [[n, h, None if g is None else [float(x) for x in g]] for n, h, g in self.hypotheses],
             "params": {k: float(v) for k, v in model_params.items()}, "H": self.H, "max_iter": self.max_iter,
+            "tol": self.tol, "settings": dict(vars(self.settings)), "grasp_offset": float(self.grasp_offset),
             "pred_noise": self.pred_noise, "horizon": self.prediction_time, "nominal_duration": self.nominal_duration,
             "stop_time": self.stop_time, "times": self.times.tolist(),
             "filter": {"switch_rate": filter_cfg["switch_rate"], "evidence_lag": filter_cfg["evidence_lag"],
@@ -170,7 +183,9 @@ class HumanMotionPredictor(Node):
             where = "in-process"
         self.get_logger().info(
             f"model parameters from {self.params_file or self.model_config or 'config'}, horizon {self.H}, "
-            f"prediction noise {self.pred_noise:.3g}; prediction engine {where} on {self.engine.device}, "
+            f"{self.settings.observability} observability, "
+            f"{'model covariance' if self.pred_noise is None else f'random-walk noise {self.pred_noise:.3g}'}; "
+            f"prediction engine {where} on {self.engine.device}, "
             f"compiled in {self.engine.compile_s:.1f} s; hypotheses: "
             f"{', '.join(n + ('' if g is None else '/' + h) for n, h, g in self.hypotheses)}")
 

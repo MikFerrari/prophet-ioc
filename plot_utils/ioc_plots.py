@@ -1,7 +1,8 @@
 """Figures of the IOC fit (train.py) and of the held-out evaluation (eval.py), as PNG files.
 
 Colors follow one rule: the IOC-fitted model is blue (slot 1), the initial weights (the starting point of the fit)
-orange (slot 2), the ground truth near-black, baselines and secondary marks in grays; text in text tones only.
+orange (slot 2), the ground truth near-black, baselines and secondary marks in grays (the data-driven baselines ProMP
+and DMP: green and purple, LEARNED); text in text tones only.
 """
 
 from pathlib import Path
@@ -15,6 +16,7 @@ import numpy as np
 FIT, INIT, THIRD = "#2a78d6", "#eb6834", "#1baf7a"
 GT = "#0b0b0b"
 GRAYS = ["#5f5e5a", "#8a8984", "#a9a8a2", "#c4c3bd"]
+LEARNED = {"promp": THIRD, "dmp": "#8a5cc2"}   # data-driven baselines (eval.baselines): own colors, thin lines
 TEXT, TEXT2, GRID, SURFACE = "#0b0b0b", "#52514e", "#e6e5e0", "#fcfcfb"
 INSTRUCTIONS = {0: "0 hands home", 1: "1 object 1 (R)", 2: "2 home", 3: "3 object 2 (L)", 4: "4 home",
                 5: "5 object 3", 6: "6 home", 7: "7 robot (both)", 8: "8 hands home"}
@@ -54,9 +56,10 @@ def plot_convergence(info: Dict, path: Path) -> Path:
         ax.plot(it, hist[:, r], color=FIT if best else GRAYS[min(r, 3)], linewidth=2.2 if best else 1.3,
                 label=label, zorder=3 if best else 2)
     ax.axhline(info["loss_base"], color=INIT, linewidth=1.2, linestyle="--", label="initial weights")
-    ax.set_yscale("log")
-    _style(ax, f"IOC fit: open-loop error per segment ({info['n_segments']} segments, {info['n_trials']} reaches)",
-           "iteration", "loss (log)")
+    if np.all(hist > 0) and info["loss_base"] > 0:
+        ax.set_yscale("log")
+    _style(ax, f"IOC fit: {info.get('objective', '')} loss per segment ({info['n_segments']} segments, {info['n_trials']} reaches)",
+           "iteration", "loss (log)" if (np.all(hist > 0) and info["loss_base"] > 0) else "loss")
     ax.legend(frameon=False, fontsize=8)
     return _save(fig, path)
 
@@ -146,7 +149,7 @@ def plot_eval_overview(summary: Dict[float, Dict], labels: Dict[str, str], path:
             ys = [summary[r].get(m, {}).get(metric, {}).get("mean", np.nan) for r in ratios]
             if not np.any(np.isfinite(ys)):
                 continue
-            c = color.get(m)
+            c = color.get(m) or LEARNED.get(m)
             if c is None:
                 c, g = GRAYS[min(g, 3)], g + 1
             ax.plot([100 * r for r in ratios], ys, color=c, linewidth=2.4 if m in color else 1.3,
@@ -171,7 +174,7 @@ def plot_by_instruction(rows: List[Dict], labels: Dict[str, str], path: Path, me
     w = 0.8 / len(methods)
     g = 0
     for j, m in enumerate(methods):
-        c = {"kin": FIT, "kin_init": INIT}.get(m)
+        c = {"kin": FIT, "kin_init": INIT}.get(m) or LEARNED.get(m)
         if c is None:
             c, g = GRAYS[min(g, 3)], g + 1
         vals = [np.mean([r[metric] for r in rows if r["method"] == m and r["instruction"] == i]) for i in insts]
@@ -190,7 +193,7 @@ def plot_error_vs_time(curves: Dict[str, np.ndarray], labels: Dict[str, str], pa
     for m, label in labels.items():
         if m not in curves:
             continue
-        c = {"kin": FIT, "kin_init": INIT}.get(m)
+        c = {"kin": FIT, "kin_init": INIT}.get(m) or LEARNED.get(m)
         if c is None:
             c, g = GRAYS[min(g, 3)], g + 1
         y = curves[m]

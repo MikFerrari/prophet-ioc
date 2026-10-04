@@ -13,12 +13,27 @@ hydra:                  # no outputs/ folder, no log files: results go to output
   job:
     chdir: false
 
-ioc:                    # train.py: IOC fit on the complete reaches of the training subjects (data.subjects - test_subjects)
-  objective: open_loop  # open_loop (open-loop keypoint prediction error) | likelihood (one-step gILQR likelihood)
+weights: null           # eval.py: shorthand for eval.params (train.py run folder, run name under output/, params.json,
+                        # latest | initial); null = eval.params
+
+ioc:                   # train.py: IOC fit on the complete reaches of the training subjects (data.subjects - test_subjects)
+  objective: likelihood # likelihood (negative log-likelihood of the probabilistic IOC model, policy solved per window)
+                        # | open_loop (ablation: open-loop keypoint prediction error)
                         # | none (keep the initial weights of config/model, only calibrate the prediction uncertainty)
-  params: null          # inferred parameters, null = cari_kinematic.FIT_PARAMS[objective]
-  T_fit: 30             # steps of a training segment, from its start to the end of the reach
-  segment_starts: [0.1, 0.3, 0.5, 0.7]  # segment starts (fractions of the reach): the handover points eval.py tests
+  observability: full   # likelihood: full (the agent knows its state; paper App. E) | partial (EKF belief, paper
+                        # Algorithm 1; obs_noise is also fitted; full is its obs_noise -> 0 limit)
+  linearization: solve  # likelihood: solve (policy of the model's optimal trajectory from each window start, unrolled
+                        # differentiable gILQR) | data (ablation, paper sec. 3.3: linearized along the data)
+  temperature: 1.0e-6   # max-ent policy u ~ N(ubar + l + L (x - xbar), temperature H^-1) (fixed, paper reaching task);
+                        # 0 = deterministic policy (no policy noise in the likelihood)
+  likelihood_block: full  # full state | velocity (fallback: score only the joint velocities)
+  solve_iters: 8        # unrolled gILQR iterations per window (likelihood with solve, open_loop)
+  checkpoint: true      # jax.checkpoint of the solver iterations and of each window: reverse-mode memory O(batch) instead
+                        # of O(windows) (the likelihood fit needs it on an 8 GB GPU); offline fit only, not the online solve
+  params: null          # inferred parameters, null = cari_kinematic.fit_param_names (the learnable weights of
+                        # config/model + residual_noise for the likelihood, + obs_noise when partially observed)
+  T_fit: 30             # steps of a training window, from its start (each of data.obs_ratios, the handover points of
+                        # eval.py) to the end of the reach
   restarts: 4           # parallel restarts (restart 0 starts from the initial weights of config/model)
   max_iter: 150         # projected Adam iterations in log10 space
   lr: 0.05              # Adam step (log10 units)
@@ -29,19 +44,40 @@ ioc:                    # train.py: IOC fit on the complete reaches of the train
   device: gpu
   output_dir: null      # null = output/train_<timestamp>
 
+wandb:                  # experiment tracking (evaluation/tracking.py) of train.py and eval.py; runs in output/wandb/
+  enabled: true         # false: no tracking
+  project: prophet-ioc
+  entity: null          # wandb user or team (null = the default of the login)
+  group: null           # e.g. an experiment name, to group a train and its eval runs
+  tags: []
+  mode: online          # online | offline (online without a login falls back to offline; upload with `wandb sync`)
+
 eval:                   # eval.py: predictions of the held-out test subjects
   params: output/latest_train   # train.py run (IOC-fitted weights, calibrated noise); null = initial weights of config/model
   compare_initial: true         # also evaluate the initial weights (method kin_init), for reference
+  baselines: [promp, dmp]       # data-driven baselines (prophet_ioc.baselines) learned once from the complete reaches of
+                                # the training subjects (never the test subjects); [] = none.
+                                # promp: ProMP (Paraschos 2013) conditioned on the prefix and the wrist goal (+ 95 % coverage)
+                                # dmp: DMP (Ijspeert 2013) from the handover state to the wrist goal (no covariance)
+  baseline_options:             # keyword options of ProMPBaseline.fit / DMPBaseline.fit (README); omitted = defaults
+    promp: {n_basis: 12, cov_reg: 0.03, n_cond: 10, phase: given}           # phase: given | ml
+    dmp: {n_basis: 30, goal_model: regression, infer_goal: true, phase: continue}  # goal_model: regression | mean;
+                                                                            # phase: continue | restart
   plot_trials: [sub_13/1, sub_13/5]  # trials (subject/instruction) with 3D html figures and frames
   device: cpu           # many small sequential solves: faster on the CPU
-  output_dir: null      # null = output/eval_<timestamp> (obs<XX>/ per observed fraction, figures/)
+  output_dir: null      # null = output/eval_<run> of the weights output/train_<run> (eval_initial_<timestamp> for the
+                        # initial weights; _2, _3, ... if it exists); obs<XX>/ per observed fraction, figures/
 
 online:                 # evaluation/goal_inference.py: online prediction replayed on whole CARI sessions (as the ROS 2 node)
-  goal_mode: inferred   # inferred: Bayesian filter over the goal locations of the cell (+ idle)
+  goal_mode: known #inferred   # inferred: Bayesian filter over the goal locations of the cell (+ idle)
                         # | known: the goal of the current instruction is given; the filter only finds hand and onset
   uncertainty: mixture  # mixture: the published covariance includes the goal uncertainty (spread of the hypotheses)
                         # | map: covariance of the most probable hypothesis only
   params: output/latest_train  # train.py run (IOC-fitted weights, prediction noise); null = initial weights of config/model
+                        # (the predictive covariance follows model.prediction_covariance, as in eval.py)
+  grasp_offset: 0.0     # m: when the goal locations are object positions, the wrist goal is this far before the object
+                        # on the line from the current wrist (human_prediction.wrist_goal); 0 = the goal location itself
+                        # (CARI v2: the goal locations are wrist positions at the end of the reaches)
   horizon: 1.0          # s predicted at every tick
   prediction_dt: 0.05   # s between prediction samples
   observation_time: 1.0 # s of measurements observed
@@ -54,3 +90,11 @@ online:                 # evaluation/goal_inference.py: online prediction replay
   clips: output/kimodo/clips.npz
   noise: false          # kimodo: add the real recordings' keypoint noise
   output_dir: null      # null = output/goal_inference_<timestamp>
+
+synthetic:              # evaluation/synthetic_recovery.py: recovery of known weights from data simulated with the model
+  objectives: [likelihood, open_loop]  # IOC objectives fitted (the other ioc.* settings as train.py)
+  offset: 0.5           # true weights = initial weights of config/model, each shifted by U(-offset, offset) decades
+  n_trials: null        # training reaches whose windows (start state, target, dt) are simulated; null = all
+  seed: 0
+  device: gpu
+  output_dir: null      # null = output/synthetic_<timestamp>

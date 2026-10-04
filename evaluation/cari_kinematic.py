@@ -1,7 +1,7 @@
 """Glue between CARI v2 trials and the 19-DOF HumanKinematicReaching predictor, shared by train.py and eval.py.
 
 Conventions (the configuration that predicts best on CARI v2):
-- every keypoint, ground truth and target in the model's frame: FK of the (Savitzky-Golay filtered) IK angles;
+- every keypoint, ground truth and target in the model's frame: FK of the (dataset-filtered) IK angles;
 - the reaching target is the wrist position at the end of the reach (offset of the wrist speed profile);
 - handover: Kalman-filtered 19-DOF joint state at t_obs from the observed joint history, with the chest rotation
   vector relative to the chest orientation at t_obs (so the trunk angular velocity is kept);
@@ -9,17 +9,20 @@ Conventions (the configuration that predicts best on CARI v2):
   which lets weights fitted on one grid (train.py) be used on the prediction grid (eval.py);
 - goal-directed baselines only get the reaching-wrist target, like the kinematic model (no per-keypoint goals).
 
-IOC fit (`fit_params`): on the complete reaches of the training subjects (segments from several handover points to
-the end of each reach), either the open-loop keypoint prediction error ("open_loop") or the one-step gILQR
-likelihood with a likelihood-only residual noise ("likelihood") is optimized over the cost weights, with parallel
-restarts of projected Adam in log10 space; the held-out test subjects (data.test_subjects) are only used by eval.py.
+IOC fit (`fit_params`): on the complete reaches of the training subjects (training windows from several handover
+points to the end of each reach, joint states from the RTS smoother under the model's dynamics or Savitzky-Golay,
+data.state_estimator), the negative log-likelihood of the probabilistic IOC model ("likelihood": policy solved per
+window, fully or partially observed, prophet_ioc.infer.multi_env) or the open-loop keypoint prediction error
+("open_loop", ablation) is minimized over the learnable cost weights (HumanKinematicParams.LEARNABLE, minus the
+switched-off terms), with parallel restarts of projected Adam in log10 space; the held-out test subjects
+(data.test_subjects) are only used by eval.py.
 """
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -29,16 +32,38 @@ from tqdm import tqdm
 
 import human_kinematic_model_jax as hkm
 from prophet_ioc.data import CariDataset, CariTrial
-from prophet_ioc.data.cari import sg_upper_body_state
-from prophet_ioc.envs.human_kinematic_reaching import HumanKinematicParams, HumanKinematicReaching, stack_envs
-from prophet_ioc.infer import MultiTrialInverseGILQR, MultiTrialTrajectoryMatching
+from prophet_ioc.data.cari import RTS_ACCEL_NOISE, RTS_OBS_NOISE, rts_upper_body_state, sg_upper_body_state
+from prophet_ioc.envs.human_kinematic_reaching import (HumanKinematicParams, HumanKinematicReaching, learnable_params,
+                                                       params_from_config, stack_envs)
+from prophet_ioc.infer import MultiTrialLikelihood, MultiTrialTrajectoryMatching
 from prophet_ioc import human_prediction as hp
 from prophet_ioc.human_prediction import (  # noqa: F401  (re-exported for train.py / eval.py / tests)
-    CHI2_3_95, JOINTS, KinematicPrediction, JointKinematicsEnv, arrival_time, coverage_fraction,
-    kalman_filter_joint_history, sg_velocity, solve_kinematic, to_timeline as to_gt_timeline,
+    CHI2_3_95, JOINTS, KinematicPrediction, JointKinematicsEnv, PredictionSettings, arrival_time, coverage_fraction,
+    kalman_filter_joint_history, prediction_settings, sg_velocity, solve_kinematic, solver_tolerance,
+    to_timeline as to_gt_timeline,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _hydra_argparse_compat() -> None:
+    """Python >= 3.14 argparse validates help strings when an argument is added; Hydra 1.3 passes a lazy, non-string
+    help object (--shell-completion), so @hydra.main fails with "badly formed help string" before the script starts.
+    Skip the check for non-string help (train.py, eval.py and goal_inference.py import this module first)."""
+    import argparse
+    check = getattr(argparse.ArgumentParser, "_check_help", None)
+    if check is None or getattr(check, "_hydra_compat", False):
+        return
+
+    def _check_help(self, action):
+        if action.help is None or isinstance(action.help, str):
+            check(self, action)
+
+    _check_help._hydra_compat = True
+    argparse.ArgumentParser._check_help = _check_help
+
+
+_hydra_argparse_compat()
 
 
 def setup_jax(device: str) -> jax.Device:
@@ -62,24 +87,37 @@ def split_subjects(data_cfg) -> Tuple[List[str], List[str]]:
 
 
 def load_trials(data_cfg, subjects: Optional[Sequence[str]] = None) -> List[CariTrial]:
-    """The trials selected by the data config (subjects x instructions, one velocity), for `subjects` (default: all
-    the subjects of the config)."""
+    """The trials selected by the data config (subjects x instructions, one or multiple velocities), for `subjects`
+    (default: all the subjects of the config)."""
     ds = CariDataset()
     trials = []
-    for s in (subjects if subjects is not None else data_cfg.subjects):
-        for i in data_cfg.instructions:
-            try:
-                trials.append(ds.load_trial(subject=s, velocity=data_cfg.velocity, instruction_id=int(i),
-                                            v_thresh_ratio=0.12))
-            except ValueError as exc:
-                print(f"  skipping {s}/inst{i}: {exc}")
+    raw = getattr(data_cfg, "velocities", getattr(data_cfg, "velocity", "FAST"))
+    vels = [raw] if isinstance(raw, str) else list(raw)
+    for vel in vels:
+        for s in (subjects if subjects is not None else data_cfg.subjects):
+            for i in data_cfg.instructions:
+                try:
+                    tr = ds.load_trial(subject=s, velocity=str(vel), instruction_id=int(i), v_thresh_ratio=0.12)
+                except ValueError as exc:
+                    print(f"  skipping {s}/inst{i}/{vel}: {exc}")
+                    continue
+                # IK failures (e.g. sub_3/inst3 SLOW, MEDIUM: 20-30 % of the reach): NaN keypoints for the baselines,
+                # a gap bridged by the RTS smoother in the IOC windows, and the wrong reaching hand (NaN wrist
+                # displacement in CariDataset.load_trial)
+                n_bad = int((~np.isfinite(tr.q28_filt[tr.onset_idx:tr.offset_idx + 1]).all(axis=1)).sum())
+                if n_bad:
+                    print(f"  skipping {s}/inst{i}/{vel}: {n_bad} of {tr.offset_idx - tr.onset_idx + 1} reach frames "
+                          f"without joint angles (IK failure)")
+                    continue
+                trials.append(tr)
     return trials
 
 
 def model_params(model_cfg) -> HumanKinematicParams:
-    """Hand-tuned parameters of the model config (fields not in the config keep the class defaults)."""
-    fields = HumanKinematicParams._fields
-    return HumanKinematicParams(**{k: float(v) for k, v in model_cfg.items() if k in fields})
+    """Parameters of the model config (initial weights and hand-tuned fixed values; fields not in the config keep the
+    class defaults; switched-off terms have weight 0): the one place where config/model is turned into parameters
+    (prophet_ioc.envs.human_kinematic_reaching.params_from_config, also used by the ROS 2 node)."""
+    return params_from_config(dict(model_cfg))
 
 
 def params_to_dict(params: HumanKinematicParams) -> Dict[str, float]:
@@ -91,8 +129,46 @@ def save_params(path: Path, params: HumanKinematicParams, info: Dict) -> None:
     path.write_text(json.dumps({"params": params_to_dict(params), **info}, indent=2))
 
 
+def load_record(path) -> Tuple[HumanKinematicParams, Dict, Path]:
+    """(parameters, the whole params.json record, its path) of a train.py run folder or params.json."""
+    path = Path(path)
+    path = path / "params.json" if path.is_dir() else path
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found: run train.py first, or use the initial weights (params=null)")
+    return load_params(path), json.loads(path.read_text()), path
+
+
+def predictor_settings(cfg, record: Optional[Dict] = None) -> PredictionSettings:
+    """PredictionSettings of the configuration (model.prediction_covariance, prediction_residual,
+    prediction_observability, belief_steps) and of the train.py record of the weights (observability and temperature
+    of the fit; None = initial weights: fully observed, ioc.temperature)."""
+    return prediction_settings(cfg.model, record, cfg.get("ioc"))
+
+
+def pred_noise_of(settings: PredictionSettings, record: Optional[Dict], obs_ratio: Optional[float], default: float
+                  ) -> Optional[float]:
+    """Noise level of the random-walk covariance (KinematicPrediction.cov): None with the model covariance; else the
+    level train.py calibrated for obs_ratio (None: the median over the observed fractions, online), or `default`
+    (model.pred_noise) for the initial weights."""
+    if not settings.random_walk:
+        return None
+    noise = (record or {}).get("pred_noise", default)
+    if not isinstance(noise, dict):
+        return float(noise)
+    if obs_ratio is None:
+        return float(np.median(list(noise.values())))
+    return float(noise.get(ratio_tag(obs_ratio), default))
+
+
 def load_params(path: Path) -> HumanKinematicParams:
-    return HumanKinematicParams(**json.loads(Path(path).read_text())["params"])
+    """Parameters of a train.py params.json: the fitted weights and the fixed values (damping, joint-limit weight,
+    ...) the fit used."""
+    saved = json.loads(Path(path).read_text())["params"]
+    unknown = sorted(set(saved) - set(HumanKinematicParams._fields))
+    if unknown:
+        raise ValueError(f"{path} was written by an older model version (unknown parameters {unknown}; the cost was "
+                         "rescaled to a unit terminal weight): run train.py again")
+    return HumanKinematicParams(**saved)
 
 
 # =============================================================================
@@ -102,8 +178,10 @@ def load_params(path: Path) -> HumanKinematicParams:
 class TrialFrames:
     kp: np.ndarray       # (N, 13, 3) FK of the filtered IK angles, every frame of the trial
     chest: np.ndarray    # (N, 3) chest position
-    target: np.ndarray   # (3,) reaching target: wrist at the end of the reach
+    target: np.ndarray   # (3,) reaching target (reaching wrist, or right wrist if both)
     hand: str            # reaching hand (dataset metadata)
+    target_right: Optional[np.ndarray] = None
+    target_left: Optional[np.ndarray] = None
 
     def keypoint(self, name: str) -> np.ndarray:
         if name == "chest":
@@ -122,9 +200,11 @@ _fk_batch = jax.jit(jax.vmap(hkm.fk, in_axes=(0, None)))
 
 def trial_frames(trial: CariTrial) -> TrialFrames:
     kp = np.array(_fk_batch(jnp.asarray(trial.q28_filt), jnp.asarray(trial.body_params)))
-    target = kp[trial.offset_idx, hkm.KP_INDEX[f"{trial.reaching_hand}_wrist"]]
-    return TrialFrames(kp, np.asarray(trial.q28_filt[:, 0:3]), np.asarray(target, dtype=np.float32),
-                       trial.reaching_hand)
+    tgt_r = np.asarray(kp[trial.offset_idx, hkm.KP_INDEX["right_wrist"]], dtype=np.float32)
+    tgt_l = np.asarray(kp[trial.offset_idx, hkm.KP_INDEX["left_wrist"]], dtype=np.float32)
+    tgt = tgt_r if trial.reaching_hand in ("right", "both") else tgt_l
+    return TrialFrames(kp, np.asarray(trial.q28_filt[:, 0:3]), tgt,
+                       trial.reaching_hand, target_right=tgt_r, target_left=tgt_l)
 
 
 def ratio_tag(obs_ratio: float) -> str:
@@ -137,53 +217,86 @@ def obs_frame(trial: CariTrial, obs_ratio: float) -> int:
     return trial.onset_idx + max(int(round(trial.reach_frames * obs_ratio)), 3)
 
 
-def infer_reaching_hand(frames: TrialFrames, onset: int, f_obs: int) -> str:
-    """Hand that moved most during the observation window."""
-    disp = {s: np.linalg.norm(frames.keypoint(f"{s}_wrist")[f_obs] - frames.keypoint(f"{s}_wrist")[onset])
-            for s in ("right", "left")}
-    return "right" if disp["right"] >= disp["left"] else "left"
+def infer_reaching_hand(frames: TrialFrames, onset: int, f_obs: int, allow_both: bool = False) -> str:
+    """Predict reaching hand from kinematic motion energy across the entire arm chain (shoulder, elbow, wrist)."""
+    energies = {}
+    for side in ("right", "left"):
+        w = frames.keypoint(f"{side}_wrist")[onset: f_obs + 1]
+        e = frames.keypoint(f"{side}_elbow")[onset: f_obs + 1]
+        s = frames.keypoint(f"{side}_shoulder")[onset: f_obs + 1]
+        if len(w) < 2:
+            disp = {side: float(np.linalg.norm(frames.keypoint(f"{side}_wrist")[f_obs] -
+                                               frames.keypoint(f"{side}_wrist")[onset]))
+                    for side in ("right", "left")}
+            return "right" if disp["right"] >= disp["left"] else "left"
+        vw, ve, vs = np.diff(w, axis=0), np.diff(e, axis=0), np.diff(s, axis=0)
+        # Weight by segment mass/leverage: wrist (1.0), forearm/elbow (1.5), upper-arm/shoulder (2.0)
+        energies[side] = float(np.sum(vw ** 2) + 1.5 * np.sum(ve ** 2) + 2.0 * np.sum(vs ** 2))
+
+    if allow_both:
+        e_tot = energies["right"] + energies["left"]
+        if e_tot > 1e-6:
+            r_ratio = energies["right"] / e_tot
+            if 0.35 <= r_ratio <= 0.65:
+                return "both"
+
+    return "right" if energies["right"] >= energies["left"] else "left"
 
 
 # =============================================================================
 # Prediction (prophet_ioc.human_prediction) on CARI trials
 # =============================================================================
-def handover_state(trial: CariTrial, f_obs: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def handover_state(trial: CariTrial, f_obs: int, damping: float = 0.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Kalman-filtered state at t_obs from the observation window [onset, t_obs] (see hp.handover_state)."""
-    return hp.handover_state(trial.q28_filt[trial.onset_idx: f_obs + 1], trial.body_params, trial.dt)
+    return hp.handover_state(trial.q28_filt[trial.onset_idx: f_obs + 1], trial.body_params, trial.dt, damping)
 
 
-def make_env(trial: CariTrial, q0: np.ndarray, q_chest_ref: np.ndarray, target: np.ndarray, dt: float, hand: str,
-             params: HumanKinematicParams) -> HumanKinematicReaching:
-    return hp.make_reaching_env(trial.body_params, trial.legs_nominal, q0, q_chest_ref, target, dt, hand, params)
+def make_env(trial: CariTrial, q0: np.ndarray, q_chest_ref: np.ndarray, target: np.ndarray, dt: float,
+             hand: str, target_left: Optional[np.ndarray] = None,
+             alpha_right: Optional[float] = None, alpha_left: Optional[float] = None) -> HumanKinematicReaching:
+    return hp.make_reaching_env(trial.body_params, trial.legs_nominal, q0, q_chest_ref, target, dt, hand,
+                                target_left=target_left, alpha_right=alpha_right, alpha_left=alpha_left)
 
 
 def kinematic_inference(trial: CariTrial, frames: TrialFrames, f_obs: int, params: HumanKinematicParams, H: int,
-                        max_iter: int, hand: str) -> KinematicPrediction:
-    """One complete prediction from the observation window [onset, f_obs], as it runs online (hp.predict_motion),
-    with the remaining duration of the reach as the upper bound of the arrival time."""
+                        max_iter: int, hand: str, tol: Optional[float] = None,
+                        settings: Optional[PredictionSettings] = None,
+                        reaching_mode: str = "dual") -> KinematicPrediction:
+    """One complete prediction from the observation window [onset, f_obs], as it runs online (hp.predict_motion; tol:
+    early stopping of the solver; settings: predictive distribution, default hp.PredictionSettings()), with the
+    remaining duration of the reach as the upper bound of the arrival time."""
+    target_left = frames.target_left if (reaching_mode == "dual" or hand == "both") else None
+    ar = 1.0 if hand in ("right", "both") else 0.0
+    al = 1.0 if hand in ("left", "both") else 0.0
     pred, _ = hp.predict_motion(trial.q28_filt[trial.onset_idx: f_obs + 1], trial.dt, trial.body_params,
                                 frames.target, params, H, max_iter, t_max=(trial.offset_idx - f_obs) * trial.dt,
-                                hand=hand, legs_nominal=trial.legs_nominal)
+                                hand=hand, legs_nominal=trial.legs_nominal, tol=tol, settings=settings,
+                                target_left=target_left, alpha_right=ar, alpha_left=al)
     return pred
 
 
+
 def prediction_error_samples(trial: CariTrial, obs_ratio: float, params: HumanKinematicParams, H: int,
-                             max_iter: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                             max_iter: int, tol: Optional[float] = None, settings: Optional[PredictionSettings] = None
+                             ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Wrist and elbow errors (n, 3) of the kinematic prediction from t_obs (as eval.py: ground-truth timeline, H steps
-    after the handover) and the two covariance terms (n, 3, 3) of KinematicPrediction."""
+    after the handover), the two random-walk covariance terms and the model covariance (n, 3, 3) of
+    KinematicPrediction (settings with covariance "both")."""
+    settings = replace(settings or PredictionSettings(), covariance="both")
     frames = trial_frames(trial)
     f_obs = obs_frame(trial, obs_ratio)
     hand = infer_reaching_hand(frames, trial.onset_idx, f_obs)
-    pred = kinematic_inference(trial, frames, f_obs, params, H, max_iter, hand)
+    pred = kinematic_inference(trial, frames, f_obs, params, H, max_iter, hand, tol, settings)
     t_rem = (trial.offset_idx - f_obs) * trial.dt
     fut = np.round(np.linspace(f_obs, trial.offset_idx, H + 1)).astype(int)[1:]
-    e, ci, cu = [], [], []
+    e, ci, cu, cm = [], [], [], []
     for part in ("wrist", "elbow"):
         j = f"{trial.reaching_hand}_{part}"
         e.append(frames.keypoint(j)[fut] - to_gt_timeline(pred.joints[j], pred.t_pred, t_rem)[1:])
         ci.append(to_gt_timeline(pred.cov_init[part], pred.t_pred, t_rem)[1:])
         cu.append(to_gt_timeline(pred.cov_unit[part], pred.t_pred, t_rem)[1:])
-    return np.concatenate(e), np.concatenate(ci), np.concatenate(cu)
+        cm.append(to_gt_timeline(pred.cov_model[part], pred.t_pred, t_rem)[1:])
+    return np.concatenate(e), np.concatenate(ci), np.concatenate(cu), np.concatenate(cm)
 
 
 def _noise_for_coverage(e, ci, cu, target: float) -> float:
@@ -197,9 +310,13 @@ def _noise_for_coverage(e, ci, cu, target: float) -> float:
 
 
 def calibrate_pred_noise(trials: Sequence[CariTrial], obs_ratio: float, params: HumanKinematicParams, H: int,
-                         max_iter: int, target: float = 0.95) -> Tuple[float, Dict]:
-    """Joint-velocity noise level of the prediction covariance such that a fraction `target` of the wrist and elbow
-    prediction errors fall inside the 95 % ellipsoids, at the evaluated horizon (predictions from t_obs).
+                         max_iter: int, target: float = 0.95, tol: Optional[float] = None,
+                         settings: Optional[PredictionSettings] = None) -> Tuple[float, Dict]:
+    """Joint-velocity noise level of the random-walk prediction covariance (PredictionSettings covariance
+    "random_walk", the ablation of the model's own covariance) such that a fraction `target` of the wrist and elbow
+    prediction errors fall inside the 95 % ellipsoids, at the evaluated horizon (predictions from t_obs). The 95 %
+    coverage of the model covariance on the same errors is reported too ("coverage_model_covariance"; it is not
+    calibrated).
 
     The level of each subject is calibrated on the other subjects' trials only (leave-one-subject-out), so the future
     of the evaluated trials is never used; "pred_noise" (all subjects) is the value for a new person. A calibration on
@@ -208,14 +325,16 @@ def calibrate_pred_noise(trials: Sequence[CariTrial], obs_ratio: float, params: 
     t_obs the errors grow with the horizon (model bias)."""
     samples = {}
     for trial in trials:
-        samples.setdefault(trial.subject, []).append(prediction_error_samples(trial, obs_ratio, params, H, max_iter))
-    pooled = lambda subjects: tuple(np.concatenate([x[i] for s in subjects for x in samples[s]]) for i in range(3))
-    by_subject = {s: _noise_for_coverage(*pooled([o for o in samples if o != s]), target) for s in samples}
-    e, ci, cu = pooled(list(samples))
+        samples.setdefault(trial.subject, []).append(prediction_error_samples(trial, obs_ratio, params, H, max_iter,
+                                                                              tol, settings))
+    pooled = lambda subjects: tuple(np.concatenate([x[i] for s in subjects for x in samples[s]]) for i in range(4))
+    by_subject = {s: _noise_for_coverage(*pooled([o for o in samples if o != s])[:3], target) for s in samples}
+    e, ci, cu, cm = pooled(list(samples))
     sigma = _noise_for_coverage(e, ci, cu, target)
     return sigma, {"pred_noise": sigma, "pred_noise_by_subject": by_subject, "calibration": "leave-one-subject-out",
                    "calibration_samples": int(len(e)),
-                   "coverage_handover_covariance_only": float(np.mean(coverage_fraction(e, ci)))}
+                   "coverage_handover_covariance_only": float(np.mean(coverage_fraction(e, ci))),
+                   "coverage_model_covariance": float(np.mean(coverage_fraction(e, cm)))}
 
 
 # =============================================================================
@@ -263,12 +382,22 @@ def predict_goal_directed(kind: str, obs_traj: np.ndarray, goal: Optional[np.nda
 # =============================================================================
 # IOC fit on the observed prefix of each trial
 # =============================================================================
-# Inferred parameters per objective. The noises of the controller (motor_noise, motor_noise_add) are not fitted:
-# fitted to the one-step residuals, which are mostly model mismatch, the motor noise goes to its upper bound, and
-# the controller, which plans against it, then stops short of the target.
-COST_PARAMS = ("action_cost", "posture_cost", "base_disp_cost", "running_vel_cost", "velocity_cost",
-               "w_act_trunk", "w_act_spine", "w_act_passive_arm", "w_act_head", "running_target_cost")
-FIT_PARAMS = {"open_loop": COST_PARAMS, "likelihood": COST_PARAMS + ("residual_noise",)}
+# Inferred parameters: the learnable cost weights the model configuration keeps (learnable_params) and, for the
+# likelihood, the likelihood-only residual noise (plus the observation noise of the partially observed model). The
+# noises of the controller (motor_noise, motor_noise_add) are not fitted: fitted to the one-step residuals, which are
+# mostly model mismatch, the motor noise went to its upper bound, and the controller, which plans against it, then
+# stopped short of the target.
+def fit_param_names(ioc_cfg, model_cfg) -> Tuple[str, ...]:
+    """Names of the inferred parameters: ioc.params if given, else the learnable cost weights of the model config
+    (+ residual_noise for the likelihood, + obs_noise when partially observed)."""
+    if ioc_cfg.get("params"):
+        return tuple(ioc_cfg.params)
+    names = learnable_params(dict(model_cfg))
+    if ioc_cfg.objective == "likelihood":
+        names += ("residual_noise",) + (("obs_noise",) if ioc_cfg.get("observability", "full") == "partial" else ())
+    return names
+
+
 # Trials per batch inside a restart (lax.map): the likelihood gradient carries the noise Jacobians of the gILQR
 # linearization and needs much more memory than the open-loop one (16 or 4 trials x 4 restarts ran out of 8 GB)
 DEFAULT_BATCH = {"open_loop": 16, "likelihood": 2}
@@ -287,35 +416,64 @@ def upper_body_output(env: HumanKinematicReaching, state: jnp.ndarray) -> jnp.nd
     return jnp.concatenate([kp[_UPPER_BODY_KP], env.chest(state)[None], kp[_HIPS].mean(axis=0)[None]]).ravel()
 
 
-def fit_segments(trial: CariTrial, params: HumanKinematicParams, starts: Sequence[float], T_fit: int
-                 ) -> List[Tuple[np.ndarray, np.ndarray, HumanKinematicReaching]]:
-    """Training segments of a complete reach (a demonstration of a training subject).
+def trial_state(trial: CariTrial, q_ref: np.ndarray, data_cfg=None, damping: float = 0.0
+                ) -> Tuple[np.ndarray, np.ndarray]:
+    """19-DOF joint positions and velocities of the whole trial (chest rotation vector relative to q_ref), estimated
+    by data.state_estimator: "rts" (default; RTS smoother under the model's ZOH dynamics with damping, noise levels
+    data.rts_accel_noise / data.rts_obs_noise) or "savgol" (Savitzky-Golay with the dataset's settings)."""
+    data_cfg = data_cfg or {}
+    estimator = data_cfg.get("state_estimator", "rts")
+    if estimator == "rts":
+        return rts_upper_body_state(trial, q_ref, accel_noise=float(data_cfg.get("rts_accel_noise", RTS_ACCEL_NOISE)),
+                                    obs_noise=float(data_cfg.get("rts_obs_noise", RTS_OBS_NOISE)), damping=damping)
+    if estimator == "savgol":
+        return sg_upper_body_state(trial, q_ref)
+    raise ValueError(f"data.state_estimator must be 'rts' or 'savgol', got {estimator}")
 
-    For each start (fraction of the reach, e.g. the handover points of eval.py), the joint state from the start to
+
+def window_starts(data_cfg) -> List[float]:
+    """Starts of the training windows: the observed fractions data.obs_ratios, i.e. the handover points of eval.py
+    (training windows aligned with the predictions)."""
+    return [float(r) for r in data_cfg.obs_ratios]
+
+
+def fit_segments(trial: CariTrial, starts: Sequence[float], T_fit: int, data_cfg=None, damping: float = 0.0
+                 ) -> List[Tuple[np.ndarray, np.ndarray, HumanKinematicReaching]]:
+    """Training windows of a complete reach (a demonstration of a training subject).
+
+    For each start (observed fraction of the reach, data.obs_ratios: the handover frame obs_frame of eval.py), the
+    joint state from the start to
     the end of the reach on T_fit steps (dt = remaining time / T_fit), as a prediction from that start would be
-    computed: positions and velocities are Savitzky-Golay estimates over the whole reach (sg_upper_body_state), the
+    computed: positions and velocities over the whole reach from trial_state (RTS smoother or Savitzky-Golay), the
     chest rotation vector is relative to the start orientation, the target is the wrist at the end of the reach.
 
     Returns a list of (x (T_fit+1, 38), mask (T_fit+1,) of ones, env).
     """
-    target = trial_frames(trial).target
+    frames = trial_frames(trial)
+    target = frames.target
+    target_left = frames.target_left
+    hand = trial.reaching_hand
+    ar = 1.0 if hand in ("right", "both") else 0.0
+    al = 1.0 if hand in ("left", "both") else 0.0
+
     segments = []
     for s in starts:
-        s_idx = trial.onset_idx + int(round(s * (trial.offset_idx - trial.onset_idx)))
+        s_idx = obs_frame(trial, s)
         q_ref = trial.q28_filt[s_idx][3:7]
-        q, qd = sg_upper_body_state(trial, q_ref)
+        q, qd = trial_state(trial, q_ref, data_cfg, damping)
         t_grid = np.linspace(s_idx, trial.offset_idx, T_fit + 1)
         x = np.concatenate([q, qd], axis=1)
         x = np.stack([np.interp(t_grid, np.arange(len(q)), x[:, j]) for j in range(x.shape[1])], axis=1)
         dt = (trial.offset_idx - s_idx) * trial.dt / T_fit
-        env = make_env(trial, x[0, :19], q_ref, target, dt, trial.reaching_hand, params)
+        env = make_env(trial, x[0, :19], q_ref, target, dt, hand,
+                       target_left=target_left, alpha_right=ar, alpha_left=al)
         segments.append((x.astype(np.float32), np.ones(T_fit + 1, dtype=np.float32), env))
     return segments
 
 
 def _groups_by_hand(segments):
     groups = []
-    for hand in ("right", "left"):
+    for hand in ("right", "left", "both"):
         seg = [s for s in segments if s[2].reaching_hand == hand]
         if seg:
             groups.append((stack_envs([s[2] for s in seg]), jnp.asarray(np.stack([s[0] for s in seg])),
@@ -323,33 +481,62 @@ def _groups_by_hand(segments):
     return groups
 
 
-def fit_params(trials: Sequence[CariTrial], base_params: HumanKinematicParams, ioc_cfg
-               ) -> Tuple[HumanKinematicParams, Dict]:
-    """IOC fit of the cost weights on the complete reaches of `trials` (fit_segments).
 
-    ioc_cfg: objective ("open_loop" | "likelihood"), params (inferred names, null = FIT_PARAMS[objective]),
-    T_fit, segment_starts, restarts, max_iter, lr, patience, tol, batch_size, seed. The parameters not inferred
-    keep their base_params values. Restart 0 starts from base_params, the others uniformly at random in log10 space
-    within HumanKinematicReaching.get_params_bounds(); all restarts run in parallel (projected Adam in log10 space,
-    one batched gradient per iteration), with a progress bar. Returns the best point visited.
+def make_objective(groups, base_params: HumanKinematicParams, infer: Sequence[str], ioc_cfg):
+    """The IOC objective of ioc_cfg over the stacked training windows `groups` (loglikelihood(None, params) to
+    maximize): "likelihood" (MultiTrialLikelihood with ioc.observability, ioc.linearization, ioc.temperature,
+    ioc.likelihood_block, ioc.solve_iters, ioc.checkpoint) or "open_loop" (MultiTrialTrajectoryMatching)."""
+    objective = ioc_cfg.objective
+    batch = ioc_cfg.get("batch_size") or DEFAULT_BATCH[objective]
+    iters = int(ioc_cfg.get("solve_iters", 8))
+    checkpoint = bool(ioc_cfg.get("checkpoint", False))
+    if objective == "open_loop":
+        return MultiTrialTrajectoryMatching(groups, base_params, infer, output_fn=upper_body_output, batch_size=batch,
+                                            solve_iters=iters, checkpoint=checkpoint)
+    if objective == "likelihood":
+        block = ioc_cfg.get("likelihood_block", "full")
+        if block not in ("full", "velocity"):
+            raise ValueError(f"ioc.likelihood_block must be 'full' or 'velocity', got {block}")
+        return MultiTrialLikelihood(groups, base_params, infer,
+                                    velocity_block=slice(19, 38) if block == "velocity" else None,
+                                    linearization=ioc_cfg.get("linearization", "solve"), solve_iters=iters,
+                                    batch_size=batch, observability=ioc_cfg.get("observability", "full"),
+                                    temperature=float(ioc_cfg.get("temperature", 1e-6)), checkpoint=checkpoint)
+    raise ValueError(f"objective must be 'likelihood' or 'open_loop', got {objective}")
+
+
+def fit_params(trials: Sequence[CariTrial], base_params: HumanKinematicParams, ioc_cfg, model_cfg, data_cfg=None,
+               callback: Optional[Callable[[int, Dict], None]] = None, segments: Optional[List] = None
+               ) -> Tuple[HumanKinematicParams, Dict]:
+    """IOC fit of the cost weights on the complete reaches of `trials` (fit_segments), or on the given training
+    windows `segments` ([(x, mask, env)] as fit_segments returns them, e.g. simulated: synthetic_recovery.py).
+
+    ioc_cfg: objective ("likelihood" | "open_loop"), observability, linearization, temperature, likelihood_block,
+    solve_iters, checkpoint, params (inferred names, null = fit_param_names), T_fit, restarts, max_iter, lr, patience,
+    tol, batch_size, seed; model_cfg: the model configuration (learnable terms); data_cfg: the window starts
+    (data.obs_ratios, the handover points of eval.py) and the state estimator of the training windows. The parameters not inferred keep their base_params values. Restart 0
+    starts from base_params, the others uniformly at random in log10 space within
+    HumanKinematicReaching.get_params_bounds(); all restarts run in parallel (projected Adam in log10 space, one
+    batched gradient per iteration), with a progress bar. Returns the best point visited.
+    callback(iteration, record), if given, is called after every iteration with the loss and gradient norm of each
+    restart, the best loss so far, the weights (log10) of each restart and of the best point, and the iteration time
+    (train.py logs it to wandb).
     """
     objective = ioc_cfg.objective
-    infer = tuple(ioc_cfg.params) if ioc_cfg.get("params") else FIT_PARAMS[objective]
-    segments = [seg for tr in trials for seg in fit_segments(tr, base_params, ioc_cfg.segment_starts, ioc_cfg.T_fit)]
+    infer = fit_param_names(ioc_cfg, model_cfg)
+    if segments is None:
+        segments = [seg for tr in trials for seg in fit_segments(tr, window_starts(data_cfg), ioc_cfg.T_fit, data_cfg,
+                                                                 base_params.damping)]
     groups = _groups_by_hand(segments)
-    batch = ioc_cfg.get("batch_size") or DEFAULT_BATCH[objective]
-    if objective == "open_loop":
-        ioc = MultiTrialTrajectoryMatching(groups, base_params, infer, output_fn=upper_body_output, batch_size=batch)
-    elif objective == "likelihood":
-        ioc = MultiTrialInverseGILQR(groups, base_params, infer, velocity_block=slice(19, 38), batch_size=batch)
-    else:
-        raise ValueError(f"objective must be 'open_loop' or 'likelihood', got {objective}")
+    ioc = make_objective(groups, base_params, infer, ioc_cfg)
     n_seg = len(segments)
 
     def to_params(theta):
         return ioc.full_params(base_params._replace(**{k: 10.0 ** theta[i] for i, k in enumerate(infer)}))
 
-    loss = lambda theta: -ioc.loglikelihood(None, to_params(theta)) / n_seg   # per segment, for the tolerance
+    # per segment, for the tolerance; the data are an argument of the compiled function, not constants (see
+    # MultiTrialLikelihood)
+    loss = lambda theta, groups: -ioc.loglikelihood(None, to_params(theta), groups) / n_seg
     lo, hi = HumanKinematicReaching.get_params_bounds()
     lo = jnp.log10(jnp.array([getattr(lo, k) for k in infer]))
     hi = jnp.log10(jnp.array([getattr(hi, k) for k in infer]))
@@ -360,23 +547,33 @@ def fit_params(trials: Sequence[CariTrial], base_params: HumanKinematicParams, i
     # Projected Adam in log10 space, all restarts in one batched value-and-gradient call per iteration (one
     # moderate compiled program; a line-search optimizer such as jaxopt.LBFGSB traces the objective several times
     # inside its loops, which took minutes to compile and ~15 s per iteration here)
-    value_and_grad = jax.jit(jax.vmap(jax.value_and_grad(loss)))
+    value_and_grad = jax.jit(jax.vmap(jax.value_and_grad(loss), in_axes=(0, None)))
     lr, b1, b2, eps = float(ioc_cfg.lr), 0.9, 0.999, 1e-8
     m = jnp.zeros_like(theta0)
     v = jnp.zeros_like(theta0)
     theta = theta0
     best_theta, best_val = np.array(theta0), np.full(ioc_cfg.restarts, np.inf)
     history, history_restarts, loss_base = [], [], None
+    stopped_early, stop_iter = False, None
 
     t_start = time.perf_counter()
     print(f"  compiling the {objective} objective ({n_seg} segments, {len(infer)} parameters, "
           f"{ioc_cfg.restarts} parallel restarts)...", flush=True)
+    t_comp = time.perf_counter()
+    val, g = value_and_grad(theta, ioc.groups)
+    jax.block_until_ready((val, g))
+    dt_comp = time.perf_counter() - t_comp
+    print(f"  ✓ compilation finished in {dt_comp:.1f}s ({dt_comp / 60:.1f} min). Starting optimization across {ioc_cfg.max_iter} iterations...\n", flush=True)
+
+    val, g = np.array(val), np.array(g)
+    loss_base = float(val[0])
     bar = tqdm(range(1, ioc_cfg.max_iter + 1), desc=f"IOC fit ({objective})", unit="it")
+    t_it = time.perf_counter()
     for it in bar:
-        val, g = value_and_grad(theta)
-        val, g = np.array(val), np.array(g)
-        if loss_base is None:
-            loss_base = float(val[0])
+        if it > 1:
+            val, g = value_and_grad(theta, ioc.groups)
+            val, g = np.array(val), np.array(g)
+        theta_it = np.array(theta)
         ok = np.isfinite(val) & np.all(np.isfinite(g), axis=1)
         better = ok & (val < best_val)
         best_val[better], best_theta[better] = val[better], np.array(theta)[better]
@@ -389,17 +586,48 @@ def fit_params(trials: Sequence[CariTrial], base_params: HumanKinematicParams, i
         theta = jnp.where(jnp.asarray(~ok)[:, None], jnp.asarray(fallback), jnp.clip(theta - step, lo, hi))
         history.append(float(np.min(best_val)))
         history_restarts.append(np.where(np.isfinite(val), val, np.nan).tolist())
-        bar.set_postfix(best=f"{history[-1]:.4g}", base=f"{loss_base:.4g}")
+        b = int(np.argmin(np.where(np.isfinite(best_val), best_val, np.inf)))
+        now = time.perf_counter()
+        step_dt = now - t_it
+        t_it = now
+        bar.set_postfix(
+            best=f"{history[-1]:.4g}",
+            base=f"{loss_base:.4g}",
+            r=b,
+            gnorm=f"{float(np.linalg.norm(g[b])):.2e}",
+            step=f"{step_dt:.1f}s",
+        )
+        if it % 10 == 0 or it == 1 or better.any():
+            bar.write(f"  [Iter {it:3d}/{ioc_cfg.max_iter}] best: {history[-1]:10.4f} (restart {b}) | "
+                      f"base: {loss_base:10.4f} | grad_norm: {float(np.linalg.norm(g[b])):8.2e} | "
+                      f"step: {step_dt:5.1f}s | elapsed: {(now - t_start)/60:4.1f} min")
+        if callback is not None:
+            callback(it, {"loss": val.tolist(), "grad_norm": np.linalg.norm(np.where(np.isfinite(g), g, 0.0),
+                                                                          axis=1).tolist(),
+                          "best_loss": history[-1], "best_restart": b, "infer": list(infer),
+                          "log10_params": theta_it.tolist(), "best_log10_params": best_theta[b].tolist(),
+                          "iteration_time_s": step_dt, "elapsed_s": now - t_start})
         if it > ioc_cfg.patience and history[-ioc_cfg.patience - 1] - history[-1] < ioc_cfg.tol * abs(history[-1]):
-            break  # the best loss improved by less than tol (relative) over the last `patience` iterations
+            stopped_early = True
+            stop_iter = it
+            break
     bar.close()
+    if stopped_early:
+        print(f"\n  ==========================================================================", flush=True)
+        print(f"  ✓ EARLY STOPPING triggered at iteration {stop_iter}/{ioc_cfg.max_iter}", flush=True)
+        print(f"    Best loss improved by < {ioc_cfg.tol:.1e} over the last {ioc_cfg.patience} iterations.", flush=True)
+        print(f"  ==========================================================================\n", flush=True)
+    else:
+        print(f"\n  ✓ Completed all {ioc_cfg.max_iter} iterations successfully.\n", flush=True)
     values = best_val
     values = np.where(np.isfinite(values), values, np.inf)
     best = int(np.argmin(values))
     fitted = to_params(jnp.asarray(best_theta[best]))
     fitted = HumanKinematicParams(**params_to_dict(fitted))  # plain floats
-    info = {"objective": objective, "infer": list(infer), "T_fit": ioc_cfg.T_fit,
-            "segment_starts": list(ioc_cfg.segment_starts), "n_trials": len(trials), "n_segments": n_seg,
+    info = {"objective": objective, "observability": ioc_cfg.get("observability", "full"),
+            "linearization": ioc_cfg.get("linearization", "solve"),
+            "temperature": float(ioc_cfg.get("temperature", 1e-6)), "infer": list(infer), "T_fit": ioc_cfg.T_fit,
+            "segment_starts": window_starts(data_cfg), "n_trials": len(trials), "n_segments": n_seg,
             "loss_base": loss_base, "loss_fit": float(values[best]), "loss_restarts": values.tolist(),
             "best_restart": best, "iterations": len(history), "loss_history": history,
             "loss_history_restarts": history_restarts,
@@ -409,19 +637,22 @@ def fit_params(trials: Sequence[CariTrial], base_params: HumanKinematicParams, i
     return fitted, info
 
 
-def segment_errors(trials: Sequence[CariTrial], params: HumanKinematicParams, ioc_cfg) -> Dict[str, np.ndarray]:
+def segment_errors(trials: Sequence[CariTrial], params: HumanKinematicParams, ioc_cfg, data_cfg=None
+                   ) -> Dict[str, np.ndarray]:
     """Open-loop prediction error of every training segment (fit_segments) with `params`: RMS over the 9 joints and
     the T_fit steps (cm), with the subject, instruction and start of each segment."""
     from prophet_ioc.infer.multi_env import trial_open_loop_error
     rows, errs = [], []
     for tr in trials:
-        for start, seg in zip(ioc_cfg.segment_starts, fit_segments(tr, params, ioc_cfg.segment_starts, ioc_cfg.T_fit)):
+        starts = window_starts(data_cfg)
+        for start, seg in zip(starts, fit_segments(tr, starts, ioc_cfg.T_fit, data_cfg, params.damping)):
             rows.append((tr.subject, tr.instruction_id, float(start), seg))
-    for hand in ("right", "left"):
+    for hand in ("right", "left", "both"):
         idx = [i for i, r in enumerate(rows) if r[3][2].reaching_hand == hand]
         if not idx:
             continue
         envs = stack_envs([rows[i][3][2] for i in idx])
+
         xs = jnp.asarray(np.stack([rows[i][3][0] for i in idx]))
         f = jax.jit(lambda e, x: jax.lax.map(lambda ex: trial_open_loop_error(ex[0], ex[1], params, upper_body_output),
                                              (e, x), batch_size=16))
@@ -432,3 +663,28 @@ def segment_errors(trials: Sequence[CariTrial], params: HumanKinematicParams, io
         err[i] = e
     return {"rms_cm": 100.0 * np.sqrt(err / 9.0), "subject": np.array([r[0] for r in rows]),
             "instruction": np.array([r[1] for r in rows]), "start": np.array([r[2] for r in rows])}
+
+
+# =============================================================================
+# Data-driven baselines (prophet_ioc.baselines: ProMP, DMP), learned from the training reaches
+# =============================================================================
+def training_reaches(trials: Sequence[CariTrial]) -> List:
+    """Complete reaches (onset -> offset, every frame) of `trials` as demonstrations of the data-driven baselines: the
+    9 joints of the evaluation (FK of the filtered IK angles, trial_frames) and the reaching hand of the metadata."""
+    from prophet_ioc.baselines import Reach
+    reaches = []
+    for tr in trials:
+        fr = trial_frames(tr)
+        reaches.append(Reach(fr.joints(slice(tr.onset_idx, tr.offset_idx + 1)), tr.reaching_hand, tr.dt))
+    return reaches
+
+
+def fit_baselines(names: Sequence[str], trials: Sequence[CariTrial], options: Optional[Dict] = None) -> Dict:
+    """{name: fitted predictor} of the data-driven baselines `names` (keys of prophet_ioc.baselines.BASELINES),
+    learned from the complete reaches of `trials` (the training subjects), with options {name: {fit kwargs}}."""
+    from prophet_ioc.baselines import BASELINES
+    unknown = [n for n in names if n not in BASELINES]
+    if unknown:
+        raise ValueError(f"unknown baselines {unknown}, available: {list(BASELINES)}")
+    reaches = training_reaches(trials)
+    return {n: BASELINES[n].fit(reaches, **dict((options or {}).get(n) or {})) for n in names}

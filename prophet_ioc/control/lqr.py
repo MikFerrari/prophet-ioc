@@ -6,7 +6,11 @@ from prophet_ioc.control.spec import LQRSpec
 
 
 class Gains(NamedTuple):
-    """LQR control gains"""
+    """(i)LQR / (i)LQG control gains of the backward pass, per time step: u_t = ubar_t + l_t + L_t (x - xbar_t).
+
+    L: feedback gain (T, m, n); l: feedforward correction (T, m) of the nominal controls, ~0 at convergence of the
+    iterative solvers (the nominal (xbar, ubar) is then optimal); H: Q_uu (T, m, m), the Hessian of the Q-function in
+    u (regularized), whose inverse is the covariance shape of the max-ent policy."""
 
     L: jnp.ndarray
     l: jnp.ndarray

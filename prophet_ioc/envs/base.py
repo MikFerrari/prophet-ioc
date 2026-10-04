@@ -6,6 +6,10 @@ from jax import jit, random, lax, vmap, numpy as jnp
 
 
 class Env(ABC):
+    # Regularization eps of Q_uu in the (g)LQR backward passes, Ht = H + max(0, eps - lambda_min(H)) I (Li's thesis
+    # 5.4.1). It must match the scale of the cost: None keeps the default of the backward pass (lqr / glqr).
+    reg_eps = None
+
     def __init__(self, state_shape, action_shape, observation_shape, state_noise_shape=None, obs_noise_shape=None):
         self._state_shape = state_shape
         self._action_shape = action_shape

@@ -43,7 +43,7 @@ def solve(p: Env,
         gains, X, U, cost = carry
 
         lqrspec = make_lqg_approx(p, params)(X, U)
-        gains = lqr.backward(lqrspec)
+        gains = lqr.backward(lqrspec) if p.reg_eps is None else lqr.backward(lqrspec, eps=p.reg_eps)
 
         # TODO: try out jaxopt line search instead
         def cond_fn(eps):

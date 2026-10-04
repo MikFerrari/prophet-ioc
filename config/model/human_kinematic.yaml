@@ -1,15 +1,62 @@
-# 19-DOF kinematic predictor: horizon and the INITIAL cost weights of the IOC fit (train.py: restart 0 starts here; the
-# fitted weights of output/latest_train are the ones eval.py, goal_inference.py and the ROS 2 node use).
-# HumanKinematicParams fields not listed keep their defaults: unit effort weights of the reaching arm, w_act_* group
-# weights 3/3/3/2, no running target cost.
+# 19-DOF kinematic predictor (HumanKinematicReaching): horizon, solver, the INITIAL learnable cost weights of the IOC
+# fit (train.py: restart 0 starts here) and the fixed, hand-tuned values. The fitted weights of output/latest_train
+# (with the fixed values the fit used) are the ones eval.py, goal_inference.py and the ROS 2 node use.
+# Read in one place: prophet_ioc.envs.human_kinematic_reaching.params_from_config (cari_kinematic.model_params, ROS 2
+# node). HumanKinematicParams fields not listed keep their class defaults.
+#
+# Cost scale: the terminal wrist-to-target term has weight 1 (not a parameter); every weight below is the former value
+# (terminal weight 100) / 100, i.e. the same optimal behaviour.
+
+# --- prediction / forward solver ---
 horizon: 14             # prediction steps from t_obs to the expected arrival
-max_iter: 3             # gILQR iterations of the prediction
-action_cost: 1.0e-4
-velocity_cost: 1.0e-2   # terminal wrist velocity
-posture_cost: 1.0e-3
-running_vel_cost: 1.0e-2
-base_disp_cost: 10.0    # pelvis displacement
-w_target: 100.0         # terminal target cost (sets the cost scale, not fitted)
-motor_noise: 0.1        # signal-dependent motor noise
-pred_noise: 0.8         # joint-velocity noise of the prediction covariance with the initial weights (train.py calibrates
-                        # it for the fitted weights)
+max_iter: 3             # maximum gILQR iterations of the prediction
+early_stopping: true    # stop the prediction solver when an iteration improves the cost by less than tol (relative)
+tol: 1.0e-3             #   (real time: usually fewer than max_iter iterations); false = always max_iter
+reaching_mode: dual     # dual: unified alpha_R, alpha_L model for single, bimanual and home reaches | single: legacy unilateral
+
+
+# --- predictive distribution (prophet_ioc.human_prediction.PredictionSettings) ---
+prediction_covariance: model  # model: the model's own predictive covariance (closed-loop linearization of the policy
+                        #   from the handover estimate and its covariance, motor noise, max-ent decision noise)
+                        # | random_walk: calibrated joint-velocity random walk (ablation, pred_noise)
+prediction_residual: true   # model covariance: also the likelihood-only residual noise of the fit (residual_noise),
+                        #   part of the fitted model of the recorded motion; false: the controller's noises only
+prediction_observability: auto  # auto: as the weights were fitted (partial for a partially observed likelihood fit:
+                        #   belief-space prediction) | full | partial
+belief_steps: 10        # partially observed: prediction steps of the history over which the agent's belief is tracked
+pred_noise: 0.8         # random_walk: joint-velocity noise of the prediction covariance with the initial weights
+                        # (train.py calibrates it for the fitted weights)
+
+# --- dynamics (fixed) ---
+damping: 0.0            # b (1/s) of qdd = u - b qd + noise, exact zero-order-hold discretization (b = 0: double
+                        # integrator). Used by the model, the handover Kalman filter, the prediction covariance and the
+                        # RTS smoother of the training data
+motor_noise: 0.1        # signal-dependent motor noise intensity (std of qd per step = motor_noise |u| sqrt(dt))
+obs_noise: 0.1          # observation noise of the partially observed model (ioc.observability: partial; fitted there)
+residual_noise: 1.0     # likelihood only (not seen by the controller): white-noise acceleration intensity absorbing
+                        # model mismatch, fitted with the weights (ioc.objective: likelihood); initial value
+
+# --- learnable cost weights (initial values; HumanKinematicParams.LEARNABLE) ---
+velocity_cost: 1.0e-4   # terminal wrist velocity
+running_vel_cost: 1.0e-4  # joint velocities at every step
+base_disp_cost: 0.1     # pelvis displacement from its position at the start of the horizon
+running_target_cost: 0.0  # wrist-to-target distance at every step (learned if running_target: true)
+# effort 0.5 * sum_j w_g u_j^2 per joint group (former action_cost 1e-4 x former group weight, / 100)
+w_act_pelvis: 2.0e-5    # pelvis translation
+w_act_trunk: 3.0e-6     # chest rotation vector
+w_act_spine: 3.0e-6     # shoulder rot x, hip rot z/x
+w_act_reach_arm: 1.0e-6 # reaching arm
+w_act_passive_arm: 3.0e-6  # other arm
+w_act_head: 2.0e-6      # head rot x/y
+
+# --- optional terms (switches) ---
+pelvis_displacement_cost: true  # false: no pelvis displacement term (e.g. walking tasks), base_disp_cost not learned
+running_target: true    # learn running_target_cost (false: keep the value above, not learned)
+joint_limit_cost: true  # joint-limit penalty 0.5 w_lim sum_j [max(0, q - q_max)^2 + max(0, q_min - q)^2] (anatomical
+                        # limits of human_kinematic_model; on CARI v2 ~4 % of the reach frames have the right elbow up
+                        # to 0.06 rad beyond 0 and a few head frames are IK flips beyond +-pi/2)
+w_lim: 1.0              # joint-limit penalty weight (hand-tuned, not learned)
+chest_rot_limit: 1.0    # rad, bound on the norm of the chest rotation vector (relative to the handover orientation)
+
+# --- other fixed values ---
+velocity_floor: 1.0e-6  # lower bound of the running joint-velocity weight (keeps the problem regular if it is ~0)
