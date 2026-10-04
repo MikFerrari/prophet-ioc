@@ -1,0 +1,14 @@
+# evaluation/example.py
+defaults:
+  - data: simulated
+  - model: nonlinear_reaching
+  - _self_
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+
+hydra:                  # no outputs/ folder, no log files
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false

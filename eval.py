@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""Evaluation of the 19-DOF kinematic predictor and of the baselines on CARI v2 reaches.
+
+For every reach of the held-out test subjects (data.test_subjects, never seen by train.py; all subjects if none) and
+every observed fraction in data.obs_ratios, the first part of the reach is observed and the rest is predicted
+(H = model.horizon steps) by
+    kin      the kinematic model (gILQR in joint space, rigid bones) with the IOC-fitted weights and calibrated
+             prediction noise of a train.py run (eval.params, default output/latest_train)
+    kin_init the same model with the initial weights of config/model (the starting point of the IOC fit), for
+             reference (eval.compare_initial)
+    cart     a damped Cartesian point mass per joint (LQR); the reaching wrist is driven to the target
+    minjerk  minimum jerk: wrist to the target, the other joints to rest with a free end position
+    gcv      goal-directed constant velocity: wrist straight to the target, the other joints at constant velocity
+    cv       constant velocity of every joint (Savitzky-Golay velocity)
+Only the reaching wrist has a goal (the target); all joints are predicted by every method.
+
+Results: output/eval_<timestamp>/ with summary.html / summary.csv over all ratios and, per ratio, obs<XX>/ with
+summary.html (best method per metric in bold), summary.csv, per_trial.csv, results.json, html/ (figures of
+eval.plot_trials) and frames/<trial>/{skeleton,skeleton_tube}/ (PNG frames + GIF); figures/ with the errors vs
+observed fraction, per instruction and along the prediction.
+
+    python eval.py                                     # weights and noise of output/latest_train
+    python eval.py eval.params=null                    # initial weights of config/model only
+"""
+
+import os
+
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+# Triton GEMM autotuning tries kernels with GiB-sized workspaces, which ran out of the 8 GB GPU memory
+os.environ.setdefault("XLA_FLAGS", "--xla_gpu_enable_triton_gemm=false")
+
+import json
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "evaluation"))  # cari_kinematic, save_results
+
+import hydra
+import jax
+import jax.numpy as jnp
+import numpy as np
+from omegaconf import DictConfig, OmegaConf
+
+import cari_kinematic as ck
+from prophet_ioc.control import gilqr
+from prophet_ioc.envs.cartesian_reaching import CartesianMultiPointReaching3D, CartesianMultiPointReaching3DParams
+from prophet_ioc.infer import predict_constant_velocity
+from plot_utils import UPPER_BODY_BONES
+from plot_utils.cari_plots import plot_trial
+from plot_utils import ioc_plots
+from save_results import METHODS, print_summary, save_overview, save_results, summarize
+
+MIN_DISTANCE_M = 0.02  # floor of the percentage normalizer (keypoints that barely move)
+
+
+def timed(fn, n: int = 15) -> float:
+    """Mean wall time of fn() in ms (fn must block until its result is ready)."""
+    t0 = time.perf_counter()
+    for _ in range(n):
+        fn()
+    return (time.perf_counter() - t0) * 1000.0 / n
+
+
+def predict_kinematic(trial, frames, f_obs, params, pred_noise, H, max_iter, hand):
+    """Kinematic prediction and wrist / elbow covariances on the ground-truth timeline, and the inference latency
+    (ms, one complete prediction from the observation window after compilation, ck.kinematic_inference)."""
+    t_rem = (trial.offset_idx - f_obs) * trial.dt
+    pred = ck.kinematic_inference(trial, frames, f_obs, params, H, max_iter, hand)  # compiles
+    latency = timed(lambda: ck.kinematic_inference(trial, frames, f_obs, params, H, max_iter, hand), n=10)
+    joints = {j: ck.to_gt_timeline(v, pred.t_pred, t_rem) for j, v in pred.joints.items()}
+    cov = {k: ck.to_gt_timeline(v, pred.t_pred, t_rem) for k, v in pred.cov(pred_noise).items()}
+    return joints, cov, latency, pred.t_pred, pred.dt_sim
+
+
+def predict_cartesian(obs, hand, target, dt_sim, t_pred, t_rem, H, dt):
+    """A damped Cartesian point mass per joint (CartesianMultiPointReaching3D, LQR): the reaching elbow / wrist pair
+    with the target on the wrist, the other joints in pairs without target. Returns joints (H+1, 3), latency."""
+    params = CartesianMultiPointReaching3DParams(action_cost=jnp.float32(1e-4), velocity_cost=jnp.float32(1e-2),
+                                                 motor_noise=jnp.float32(0.1), obs_noise=jnp.float32(0.5))
+    w, e = f"{hand}_wrist", f"{hand}_elbow"
+    others = [j for j in ck.JOINTS if j not in (w, e)]
+    pairs = [(e, w)] + [(others[i], others[min(i + 1, len(others) - 1)]) for i in range(0, len(others), 2)]
+
+    def state(a, b):
+        return jnp.asarray(np.concatenate([obs[a][-1], obs[b][-1], ck.sg_velocity(obs[a], dt),
+                                           ck.sg_velocity(obs[b], dt)]), dtype=jnp.float32)
+
+    U0 = jnp.zeros((H, 6), dtype=jnp.float32)
+    solvers = {}
+    for goal in (True, False):
+        env = CartesianMultiPointReaching3D(dt=dt_sim, target_hand=target, target_elbow=obs[e][-1],
+                                            x0=state(e, w), w_target_hand=100.0 if goal else 0.0,
+                                            w_target_elbow=0.0)
+        solvers[goal] = jax.jit(lambda x, env=env: gilqr.solve(p=env, x0=x, U_init=U0, params=params, max_iter=1)[1])
+    states = [state(a, b) for a, b in pairs]
+
+    def run():
+        return [solvers[k == 0](x).block_until_ready() for k, x in enumerate(states)]
+
+    Xs = run()
+    latency = timed(run)
+    out = {}
+    for (a, b), X in zip(pairs, Xs):  # state = [pos a, pos b, vel a, vel b]; the last pair may repeat a joint
+        X = ck.to_gt_timeline(np.array(X), t_pred, t_rem)
+        out.setdefault(a, X[:, 0:3])
+        out.setdefault(b, X[:, 3:6])
+    return out, latency
+
+
+def metrics(pred, gt, hand, nom_bones):
+    """Errors in cm and in % of each keypoint's remaining distance (from its position at the first predicted step to
+    its final position, i.e. to the target for the reaching wrist; at least MIN_DISTANCE_M), and the maximum
+    bone-length distortion in % over the upper-body bones."""
+    err = {j: np.linalg.norm(pred[j] - gt[j], axis=1) for j in ck.JOINTS}
+    dist = {j: max(float(np.linalg.norm(gt[j][-1] - gt[j][0])), MIN_DISTANCE_M) for j in ck.JOINTS}
+    pct = {j: err[j] / dist[j] * 100.0 for j in ck.JOINTS}
+    distortion = max(float(np.max(np.abs(np.linalg.norm(pred[a] - pred[b], axis=1) - L)) / max(L, 1e-4) * 100.0)
+                     for (a, b), L in nom_bones.items())
+    w, e = f"{hand}_wrist", f"{hand}_elbow"
+    return {"mpjpe_cm": float(np.mean([err[j].mean() for j in ck.JOINTS]) * 100.0),
+            "mpjpe_pct": float(np.mean([pct[j].mean() for j in ck.JOINTS])),
+            "wrist_ade_cm": float(err[w].mean() * 100.0), "wrist_ade_pct": float(pct[w].mean()),
+            "wrist_fde_cm": float(err[w][-1] * 100.0), "wrist_fde_pct": float(pct[w][-1]),
+            "elbow_ade_cm": float(err[e].mean() * 100.0), "elbow_ade_pct": float(pct[e].mean()),
+            "elbow_fde_cm": float(err[e][-1] * 100.0), "elbow_fde_pct": float(pct[e][-1]),
+            "bone_distortion_pct": distortion}
+
+
+def evaluate_trial(trial, obs_ratio, params, pred_noise, cfg, initial=None):
+    H, dt = int(cfg.model.horizon), trial.dt
+    frames = ck.trial_frames(trial)
+    f_obs = ck.obs_frame(trial, obs_ratio)
+    fut = np.round(np.linspace(f_obs, trial.offset_idx, H + 1)).astype(int)
+    t_obs = (f_obs - trial.onset_idx) * dt
+    fut_time = np.linspace(t_obs, trial.reach_frames * dt, H + 1)
+    t_rem = (trial.offset_idx - f_obs) * dt
+    obs = frames.joints(slice(trial.onset_idx, f_obs + 1))
+    gt = frames.joints(fut)
+    onset_pose = frames.joints(trial.onset_idx)
+    nom_bones = {(a, b): float(np.linalg.norm(onset_pose[a] - onset_pose[b])) for a, b in UPPER_BODY_BONES}
+    hand = trial.reaching_hand
+    w = f"{hand}_wrist"
+
+    kin, cov, lat_kin, t_pred, dt_sim = predict_kinematic(trial, frames, f_obs, params, pred_noise, H,
+                                                          int(cfg.model.max_iter),
+                                                          ck.infer_reaching_hand(frames, trial.onset_idx, f_obs))
+    cart, lat_cart = predict_cartesian(obs, hand, frames.target, dt_sim, t_pred, t_rem, H, dt)
+    methods, latency, covs = {"kin": kin, "cart": cart}, {"kin": lat_kin, "cart": lat_cart}, {"kin": cov}
+    if initial is not None:   # (params, pred_noise) of the initial weights
+        methods["kin_init"], covs["kin_init"], latency["kin_init"], _, _ = predict_kinematic(
+            trial, frames, f_obs, initial[0], initial[1], H, int(cfg.model.max_iter),
+            ck.infer_reaching_hand(frames, trial.onset_idx, f_obs))
+    goal = lambda j: frames.target if j == w else None
+    for name in ("minjerk", "gcv"):
+        methods[name] = {j: ck.predict_goal_directed(name, obs[j], goal(j), fut_time, dt) for j in ck.JOINTS}
+        latency[name] = timed(lambda: [ck.predict_goal_directed(name, obs[j], goal(j), fut_time, dt)
+                                       for j in ck.JOINTS], 20)
+    methods["cv"] = {j: predict_constant_velocity(obs[j], fut_time, dt) for j in ck.JOINTS}
+    latency["cv"] = timed(lambda: [predict_constant_velocity(obs[j], fut_time, dt) for j in ck.JOINTS], 20)
+
+    rows, mets = [], {}
+    for m, pred in methods.items():
+        mets[m] = metrics(pred, gt, hand, nom_bones)
+        mets[m]["latency_ms"] = latency[m]
+        mets[m]["rate_hz"] = 1000.0 / latency[m]
+        if m in covs:
+            for part in ("wrist", "elbow"):
+                j = f"{hand}_{part}"
+                mets[m][f"coverage_{part}_pct"] = float(np.mean(ck.coverage_fraction(gt[j] - pred[j],
+                                                                                     covs[m][part])) * 100)
+        rows.append({"subject": trial.subject, "instruction": trial.instruction_id, "method": m, **mets[m]})
+    record = {"subject": trial.subject, "velocity": trial.velocity, "instruction": trial.instruction_id,
+              "task": trial.task_description, "obs_ratio": obs_ratio, "pred_dur": t_rem, "H": H, "hand": hand,
+              "dt": dt, "target": frames.target, "obs": obs, "gt": gt, "methods": methods, "metrics": mets,
+              "cov": cov, "nom_bone_lens": nom_bones,
+              "wrist_error_curve": {m: np.linalg.norm(p[w] - gt[w], axis=1) * 100.0 for m, p in methods.items()}}
+    return rows, record
+
+
+def parameters_for(cfg, obs_ratio):
+    """IOC-fitted weights and calibrated prediction noise of a train.py run (eval.params: run folder or params.json),
+    else the initial weights of config/model with model.pred_noise."""
+    if not cfg.eval.params:
+        return ck.model_params(cfg.model), float(cfg.model.pred_noise), "initial weights (config/model)"
+    path = Path(cfg.eval.params)
+    if path.is_dir():
+        path = path / "params.json"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found: run train.py first, or evaluate the initial weights with "
+                                "eval.params=null")
+    data = json.loads(path.read_text())
+    noise = data.get("pred_noise", {})
+    sigma = noise.get(ck.ratio_tag(obs_ratio), cfg.model.pred_noise) if isinstance(noise, dict) else noise
+    return ck.load_params(path), float(sigma), f"IOC-fitted, {path}"
+
+
+@hydra.main(version_base=None, config_path="config", config_name="config")
+def main(cfg: DictConfig):
+    os.chdir(ck.REPO_ROOT)  # relative paths (config, output/) refer to the repository root
+    device = ck.setup_jax(cfg.eval.device)
+    root = Path(cfg.eval.output_dir or Path("output") / f"eval_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    _, test_subjects = ck.split_subjects(cfg.data)
+    trials = ck.load_trials(cfg.data, test_subjects)
+    plot_keys = {str(t) for t in cfg.eval.plot_trials or []}
+    overview, all_rows, curves = {}, [], {}
+    for obs_ratio in [float(r) for r in cfg.data.obs_ratios]:
+        params, pred_noise, source = parameters_for(cfg, obs_ratio)
+        initial = (ck.model_params(cfg.model), float(cfg.model.pred_noise)) \
+            if cfg.eval.compare_initial and cfg.eval.params else None
+        out = root / ck.ratio_tag(obs_ratio)
+        print(f"\n=== {obs_ratio:.0%} observed | {len(trials)} {cfg.data.velocity} reaches of {', '.join(test_subjects)}"
+              f" | parameters: {source} | prediction noise {pred_noise:.3g} | device {device}", flush=True)
+        rows, figures = [], []
+        with jax.default_device(device):
+            for k, trial in enumerate(trials, 1):
+                r, record = evaluate_trial(trial, obs_ratio, params, pred_noise, cfg, initial)
+                rows += r
+                for m, c in record["wrist_error_curve"].items():
+                    curves.setdefault(m, []).append(c)
+                kin = record["metrics"]["kin"]
+                print(f"  [{k:2d}/{len(trials)}] {trial.subject:6s} inst{trial.instruction_id} | kin MPJPE "
+                      f"{kin['mpjpe_cm']:5.2f} cm, wrist FDE {kin['wrist_fde_cm']:5.2f} cm, wrist coverage "
+                      f"{kin['coverage_wrist_pct']:3.0f}% | best baseline MPJPE "
+                      f"{min(record['metrics'][m]['mpjpe_cm'] for m in record['metrics'] if m != 'kin'):5.2f} cm",
+                      flush=True)
+                if f"{trial.subject}/{trial.instruction_id}" in plot_keys:
+                    figures += plot_trial(record, out)
+        meta = {"n_trials": len(trials), "velocity": cfg.data.velocity, "subjects": test_subjects,
+                "instructions": list(cfg.data.instructions), "obs_ratio": obs_ratio, "params_source": source,
+                "params": ck.params_to_dict(params), "pred_noise": pred_noise,
+                "config": OmegaConf.to_container(cfg, resolve=True)}
+        save_results(rows, meta, out)
+        all_rows += rows
+        overview[obs_ratio] = summarize(rows)
+        print_summary(overview[obs_ratio])
+        if figures:
+            print(f"  figures: {out / 'html'}, frames: {out / 'frames'}")
+    save_overview(overview, root)
+    labels = {m: label for m, label in METHODS}
+    fig_dir = root / "figures"
+    ioc_plots.plot_eval_overview(overview, labels, fig_dir / "errors_vs_observed_fraction.png")
+    ioc_plots.plot_by_instruction(all_rows, labels, fig_dir / "errors_by_instruction.png")
+    ioc_plots.plot_error_vs_time({m: np.mean(c, axis=0) for m, c in curves.items()}, labels,
+                                 fig_dir / "wrist_error_along_prediction.png")
+    latest = Path("output/latest")
+    if latest.is_symlink() or latest.exists():
+        latest.unlink()
+    latest.symlink_to(root.resolve(), target_is_directory=True)
+    print(f"\nResults in {root} (output/latest): summary.html, summary.csv and one folder per observed fraction")
+
+
+if __name__ == "__main__":
+    main()

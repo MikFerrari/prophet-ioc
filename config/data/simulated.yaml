@@ -1,0 +1,5 @@
+restarts: 10
+trials: 20
+seed: 1
+cpu: false
+

@@ -1,0 +1,56 @@
+# evaluation/train.py and evaluation/eval.py
+defaults:
+  - data: cari
+  - model: human_kinematic
+  - _self_
+  - override hydra/job_logging: disabled
+  - override hydra/hydra_logging: disabled
+
+hydra:                  # no outputs/ folder, no log files: results go to output/
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false
+
+ioc:                    # train.py: IOC fit on the complete reaches of the training subjects (data.subjects - test_subjects)
+  objective: open_loop  # open_loop (open-loop keypoint prediction error) | likelihood (one-step gILQR likelihood)
+                        # | none (keep the initial weights of config/model, only calibrate the prediction uncertainty)
+  params: null          # inferred parameters, null = cari_kinematic.FIT_PARAMS[objective]
+  T_fit: 30             # steps of a training segment, from its start to the end of the reach
+  segment_starts: [0.1, 0.3, 0.5, 0.7]  # segment starts (fractions of the reach): the handover points eval.py tests
+  restarts: 4           # parallel restarts (restart 0 starts from the initial weights of config/model)
+  max_iter: 150         # projected Adam iterations in log10 space
+  lr: 0.05              # Adam step (log10 units)
+  patience: 20          # stop when the best loss improved by less than tol (relative) over patience iterations
+  tol: 1.0e-3
+  batch_size: null      # segments per batch inside a restart (lower = less GPU memory); null = 16 (open_loop), 2 (likelihood)
+  seed: 0
+  device: gpu
+  output_dir: null      # null = output/train_<timestamp>
+
+eval:                   # eval.py: predictions of the held-out test subjects
+  params: output/latest_train   # train.py run (IOC-fitted weights, calibrated noise); null = initial weights of config/model
+  compare_initial: true         # also evaluate the initial weights (method kin_init), for reference
+  plot_trials: [sub_13/1, sub_13/5]  # trials (subject/instruction) with 3D html figures and frames
+  device: cpu           # many small sequential solves: faster on the CPU
+  output_dir: null      # null = output/eval_<timestamp> (obs<XX>/ per observed fraction, figures/)
+
+online:                 # evaluation/goal_inference.py: online prediction replayed on whole CARI sessions (as the ROS 2 node)
+  goal_mode: inferred   # inferred: Bayesian filter over the goal locations of the cell (+ idle)
+                        # | known: the goal of the current instruction is given; the filter only finds hand and onset
+  uncertainty: mixture  # mixture: the published covariance includes the goal uncertainty (spread of the hypotheses)
+                        # | map: covariance of the most probable hypothesis only
+  params: output/latest_train  # train.py run (IOC-fitted weights, prediction noise); null = initial weights of config/model
+  horizon: 1.0          # s predicted at every tick
+  prediction_dt: 0.05   # s between prediction samples
+  observation_time: 1.0 # s of measurements observed
+  samples: 30           # uniform samples of the observation window
+  rate: 15.0            # predictions per second
+  angles: raw           # raw (IK of the raw keypoints, as online) | filt (centred-filtered, non-causal)
+  device: gpu
+  reuse: null           # output folder of a previous run: reuse its predictions (sessions.pkl), recompute tables / figures
+  source: cari          # cari | kimodo (clips of evaluation/kimodo_reaches.py)
+  clips: output/kimodo/clips.npz
+  noise: false          # kimodo: add the real recordings' keypoint noise
+  output_dir: null      # null = output/goal_inference_<timestamp>

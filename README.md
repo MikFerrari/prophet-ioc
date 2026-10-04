@@ -16,20 +16,26 @@ The toolkit evaluates both offline on real pick-and-place trajectories from the 
 ## 1. Installation & Environment Setup
 
 ### 1.1 Virtual Environment
-Create a fresh Python virtual environment (`>= 3.10`, tested up to Python 3.14) and install the package with dependencies:
+Create the virtual environment in `.venv` (named `prophet_venv`, the prompt shown when active; Python `>= 3.11`, tested with 3.14) and install the package in editable
+mode with all its dependencies (declared in `pyproject.toml`; `cuda` adds the NVIDIA GPU build of JAX, `dev` pytest
+and the tools of `human_kinematic_model`):
 
 ```bash
-python -m venv env
-source env/bin/activate
-pip install -e .
-pip install hydra-core omegaconf pandas scipy plotly pytest
+python3 -m venv --upgrade-deps --prompt prophet_venv .venv
+source .venv/bin/activate
+pip install -e ".[cuda,dev]"     # CPU only: pip install -e ".[dev]"
 ```
 
+Do not rename or move the venv after creating it: its scripts (`pip`, `pytest`, `activate`) hard-code its path.
+Recreate it instead.
+
 ### 1.2 Human Kinematic Model Dependency
-The JAX-differentiable 28-DOF kinematic chain is provided by the sibling repository `human_kinematic_model`:
+The JAX-differentiable 28-DOF kinematic chain (`human_kinematic_model_jax`) is a script of the sibling repository
+`human_kinematic_model`, not a pip package: put its `scripts/` folder on the venv's path with a `.pth` file:
 
 ```bash
-pip install -e ../human_kinematic_model
+realpath ../human_kinematic_model/scripts \
+    > "$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')/human_kinematic_model.pth"
 ```
 
 ### 1.3 Hardware Acceleration
@@ -74,55 +80,65 @@ prophet-ioc/
 
 All scripts log to dedicated timestamped directories under `output/`, and maintain symbolic links (`output/latest_train`, `output/latest`, `output/latest_goal_inference`) pointing to the most recent run.
 
-### 3.1 CARI v2 Training & Benchmarking (`train.py`, `eval.py`)
+### 3.1 CARI v2 IOC Fitting & Held-out Evaluation (`train.py`, `eval.py`)
 
-Run training and comparative evaluation across observed reaching prefixes (default: 10%, 30%, 50%, 70%):
+The cost weights are learned from demonstrations: `train.py` fits them by IOC on the complete reaches of all subjects
+but the held-out one (`data.test_subjects`, default `sub_13`), all instructions, FAST; `eval.py` predicts the
+held-out subject's reaches from 10 / 30 / 50 / 70 % observed with the fitted weights (and, for reference, with the
+initial weights of `config/model/human_kinematic.yaml`, which are only the starting point of the fit).
 
 ```bash
-source env/bin/activate
-
-# 1. Fit cost weights via IOC and calibrate prediction uncertainty
-python train.py
-
-# (Optional) Calibration only with default hand-tuned weights:
-python train.py ioc.objective=none
-
-# 2. Evaluate kinematic predictor against baselines (Cartesian, Min-Jerk, GCV, CV)
-python eval.py eval.params=output/latest_train
+source .venv/bin/activate
+python train.py          # IOC fit + uncertainty calibration -> output/train_<ts>/ (params.json, figures/)
+python eval.py           # held-out subject, fitted weights of output/latest_train -> output/eval_<ts>/ (figures/)
 ```
 
-#### Key Hydra Command-Line Overrides:
 | Parameter | Default | Description |
 |---|---|---|
-| `data.subjects` | `['sub_1', ...]` | Subjects evaluated (default: all 10 subjects) |
-| `data.instructions` | `[1, 3, 5]` | Reaching instructions (1=Obj1, 3=Obj2, 5=Obj3; FAST velocity) |
-| `data.obs_ratios` | `[0.1, 0.3, 0.5, 0.7]` | Observed fraction of the reach; remaining trajectory is predicted |
-| `ioc.objective` | `open_loop` | `open_loop` (tracking error), `likelihood` (one-step gILQR), or `none` |
-| `ioc.restarts` | `10` | Parallel Adam restarts in log10 space |
-| `eval.params` | `output/latest_train` | Path to fitted parameters, or `null` for default parameters |
-| `eval.plot_trials` | `null` | Specific trials (`subject/instruction`) for visual frame sequences |
+| `data.subjects` | 10 subjects | CARI v2 subjects |
+| `data.test_subjects` | `[sub_13]` | Held out: never used by `train.py`, evaluated by `eval.py` |
+| `data.instructions` | `[0 ... 8]` | All instructions (1, 3, 5 objects; 7 robot, both hands; 0, 2, 4, 6, 8 hands home) |
+| `data.obs_ratios` | `[0.1, 0.3, 0.5, 0.7]` | Observed fractions of the reach evaluated by `eval.py` |
+| `ioc.objective` | `open_loop` | `open_loop` (open-loop keypoint error), `likelihood` (one-step gILQR), `none` (initial weights) |
+| `ioc.segment_starts` | `[0.1, 0.3, 0.5, 0.7]` | Training segments: from these handover points to the end of each demonstration |
+| `ioc.restarts` | `4` | Parallel projected-Adam restarts in log10 space (restart 0 from the initial weights) |
+| `eval.params` | `output/latest_train` | Fitted weights and calibrated noise; `null` = initial weights |
+| `eval.compare_initial` | `true` | Also evaluate the initial weights (method `kin_init`) |
+
+Figures: `output/train_<ts>/figures/` (convergence of the restarts, initial vs fitted weights within the bounds,
+open-loop error of the training reaches before / after the fit by handover point and instruction, example
+predictions), `output/eval_<ts>/figures/` (errors vs observed fraction, per instruction, along the prediction).
 
 ---
 
-### 3.2 Online Goal Inference on Full Sessions (`evaluation/goal_inference.py`)
+### 3.2 Online Prediction on Full Sessions: Goal Inferred or Known (`evaluation/goal_inference.py`)
 
-In unstructured environments, the target is unknown ahead of time. `goal_inference.py` replays continuous CARI sessions (8 sequential movements across 7 task targets + idle) as perceived by a perception pipeline:
+`goal_inference.py` replays continuous CARI sessions (8 movements across 7 goal locations + idle) as the ROS 2 node
+sees them, with the IOC-fitted weights. Two switches in `config/config.yaml` (`online`):
+
+| Parameter | Values | Description |
+|---|---|---|
+| `online.goal_mode` | `inferred` / `known` | Goal inferred among the goals of the cell (Bayesian filter), or given by the task schedule (the filter then only finds hand and onset) |
+| `online.uncertainty` | `mixture` / `map` | Published covariance with the goal uncertainty (posterior-weighted spread of the hypotheses around the published prediction) or of the most probable hypothesis only |
 
 ```bash
-cd evaluation
-# Run online goal filter on CARI sessions
-python goal_inference.py
-
-# Re-generate figures and summary tables from saved cache:
-python goal_inference.py --reuse output/latest_goal_inference
-cd ..
+python evaluation/goal_inference.py                                     # inferred goal, goal-aware covariance
+python evaluation/goal_inference.py online.goal_mode=known online.uncertainty=map
+python evaluation/goal_inference.py online.reuse=output/latest_goal_inference   # tables / figures only
 ```
 
-The online predictor evaluates 8 goal hypotheses with a receding horizon and updates a recursive Bayesian filter incorporating heading kinematics, gaze cues, and movement onset evidence.
+Both goal modes, the oracle (goal and onset known), constant velocity and a frozen pose are always reported, with
+the wrist coverage of both covariances. The filter settings are selected on the training subjects; results are
+reported on the held-out subject. Figures: goal accuracy over the movement, a session timeline (posterior over the
+hypotheses, goal entropy, 95 % radius of the prediction with and without the goal uncertainty) and top-view
+snapshots of the goal uncertainty during each reach. The same switches exist in the ROS 2 node (`goal_mode`,
+`uncertainty` in `ros2/human_motion_predictor/config/predictor.yaml`).
 
 ---
 
-### 3.3 Synthetic Diffusion Reaches with NVIDIA Kimodo (`evaluation/kimodo_reaches.py`)
+### 3.3 Synthetic Diffusion Reaches with NVIDIA Kimodo (`evaluation/kimodo_reaches.py`, on hold)
+
+> On hold: `kimodo_reaches.py compare` still reads the previous `goal_inference.py` results format.
 
 To evaluate whether motion diffusion models can substitute for expensive optical mocap, the toolkit benchmarks synthetic clips generated with **Kimodo**:
 
@@ -136,10 +152,10 @@ python kimodo_reaches.py layout
 ../../kimodo/.venv/bin/python kimodo_reaches.py generate
 
 # 3. Test online goal inference on clean synthetic keypoints
-python goal_inference.py --source kimodo --filter-from output/latest_goal_inference
+python goal_inference.py online.source=kimodo online.clips=output/kimodo/clips_text.npz
 
 # 4. Test online goal inference with simulated ZED depth sensor noise
-python goal_inference.py --source kimodo --noise --filter-from output/latest_goal_inference
+python goal_inference.py online.source=kimodo online.clips=output/kimodo/clips_text.npz online.noise=true
 
 # 5. Generate side-by-side real vs synthetic comparison report
 python kimodo_reaches.py compare output/latest_goal_inference \
@@ -204,7 +220,7 @@ Every run writes structured, self-contained artifacts to `output/`:
 Run the complete test suite (35 unit and integration tests):
 
 ```bash
-./env/bin/python -m pytest tests/
+./.venv/bin/python -m pytest
 ```
 
 ---

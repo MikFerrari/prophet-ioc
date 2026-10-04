@@ -1,0 +1,49 @@
+# Parameters of the human_motion_predictor node (see human_motion_predictor/node.py)
+human_motion_predictor:
+  ros__parameters:
+    input: zed                                          # zed (ZED skeletons + IK) | joints (q 28 + body params 8)
+    skeleton_topic: /zed/zed_node/body_trk/skeletons    # zed_msgs/ObjectsStamped (zed-ros2-wrapper body tracking)
+    joints_topic: ~/joints                              # std_msgs/Float64MultiArray, input: joints
+    person_id: -1                                       # ZED tracking id (label_id), -1 = first tracked person
+    goal_mode: inferred                                 # inferred (among goal_names) | known (target / target_topic: the
+                                                        #   task scheduler gives the current goal; the filter finds hand
+                                                        #   and onset)
+    uncertainty: mixture                                # mixture: published wrist covariance includes the goal
+                                                        #   uncertainty | map: covariance of the hypothesis only
+    # goals: candidate goal locations of the cell (frame of the input), inferred online; e.g. from
+    # evaluation/export_replay.py (<session>_goals.yaml). Without them: a known target (target / target_topic)
+    goal_names: [""]                                    # e.g. [conveyor, plate_slot_1, plate_slot_2, home]
+    goal_positions: [0.0]                               # [x1, y1, z1, x2, y2, z2, ...] (m)
+    goal_hands: [""]                                    # per goal: right | left | both ([""] = both for all)
+    idle_hypothesis: true                               # also "coming to rest" (no reach)
+    target: [0.0]                                       # goal_mode known: fixed [x, y, z]; [0.0] = use target_topic
+    target_topic: ~/target                              # goal_mode known: geometry_msgs/PointStamped (current goal)
+    hand: auto                                          # hands of the hypotheses: auto (goal_hands) | right | left
+    # windows
+    observation_time: 1.0                               # observation window: last s of measurements (circular buffer)
+    observation_samples: 30                             # uniform samples of the window for the filter (fixed shapes)
+    prediction_time: 1.0                                # prediction window: s after the last observation (any length)
+    prediction_dt: 0.05                                 # s between the published prediction samples
+    rate: 15.0                                          # predictions per second
+    # receding-horizon prediction and goal inference (prophet_ioc.human_prediction)
+    nominal_duration: 0.95                              # s, minimum-jerk duration of a reach (CARI v2 FAST: 0.95)
+    stop_time: 0.3                                      # s, idle hypothesis: time to come to rest
+    switch_rate: 0.5                                    # 1/s, rate of goal changes of the filter
+    evidence_lag: 0.3                                   # s, evidence: observation vs the prediction made this earlier
+    evidence_temperature: 0.25                          # tempering of the evidence (overlapping lag windows)
+    evidence_obs_noise: 0.01                            # m, observation noise of the filtered wrists
+    kappa_heading: 2.0                                  # cue prior: wrist velocity towards the goal
+    kappa_gaze: 1.0                                     # cue prior: gaze (nose - mid-ears) towards the goal (zed input)
+    device: ""                                          # JAX device: cpu | gpu; "" = $HMP_DEVICE (predictor-gpu: gpu) or cpu
+    worker_python: ""                                   # python of the prediction worker (engine.py); "" = $HMP_WORKER_PYTHON
+                                                        #   (the images: /opt/jax, numpy 2 + current JAX) or in-process
+    model_config: ""                                    # "" = $PROPHET_ROOT/config/model/human_kinematic.yaml
+    params_file: ""                                     # train.py params.json (IOC-fitted weights + noise); "" = the
+                                                        #   latest run (output/latest_train), "initial" = config/model
+    publish_markers: true                               # RViz: predicted trajectories, final posture, 95 % wrist, goals
+    publish_hypotheses: true                            # all hypotheses on ~/hypotheses (PredictedMotionHypotheses)
+    frame_id: ""                                        # "" = frame of the input
+    warmup: true                                        # compile at start-up (otherwise the first prediction is slow)
+    world_frame: ""                                     # transform the ZED keypoints to this frame (TF), "" = keep theirs
+    head_keypoint: nose                                 # model "head": nose (as the CARI data) | ears (midpoint)
+    joint_limits: cari                                  # IK limits: cari (+-pi, as the CARI data) | model (anatomical)

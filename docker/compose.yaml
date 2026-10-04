@@ -1,0 +1,62 @@
+# Human motion predictor. Same host network / IPC as the ZED container (zed-ros2-wrapper), so that the topics are
+# exchanged through DDS (and shared memory) with the same ROS_DOMAIN_ID and RMW_IMPLEMENTATION.
+#
+#   docker compose -f docker/compose.yaml up --build                    # predictor on the ZED skeletons
+#   docker compose -f docker/compose.yaml run --rm predictor \
+#       ros2 launch human_motion_predictor predictor.launch.py input:=zed replay:=true      # CARI replay, no camera
+#   docker compose -f docker/compose.yaml run --rm predictor-gpu ...                       # the same, JAX on the GPU
+name: human-motion-prediction
+
+x-predictor: &predictor
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-ros:jazzy-ros-base}
+    image: human-motion-predictor:jazzy
+    network_mode: host
+    ipc: host
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      - RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}   # must match the ZED container
+      - CYCLONEDDS_URI=${CYCLONEDDS_URI:-}
+      - JAX_PLATFORMS=cpu
+      # nothing is written into the mounted source: bytecode and the JAX compilation cache go to the ros2_ws volume
+      - PYTHONPYCACHEPREFIX=/ros2_ws/pycache
+      - JAX_COMPILATION_CACHE_DIR=/ros2_ws/jax_cache
+      - JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0   # cache every compiled program (faster start-up)
+    volumes:
+      # source code (shared): edits of the python code apply at the next start of the node
+      - ..:/workspace/prophet-ioc
+      - ${HKM_SRC:-../../human_kinematic_model}:/workspace/human_kinematic_model:ro
+      # colcon build / install / log of the mounted ROS 2 packages
+      - ros2_ws:/ros2_ws
+    command: ["ros2", "launch", "human_motion_predictor", "predictor.launch.py"]
+
+services:
+  predictor:
+    <<: *predictor
+  predictor-gpu:
+    <<: *predictor
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-ros:jazzy-ros-base}
+        JAX_PACKAGE: jax[cuda12]
+    image: human-motion-predictor:jazzy-gpu
+    gpus: all
+    environment:
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      - RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
+      - CYCLONEDDS_URI=${CYCLONEDDS_URI:-}
+      - JAX_PLATFORMS=cpu                     # node (IK); the prediction worker uses the GPU
+      - XLA_PYTHON_CLIENT_PREALLOCATE=false   # the GPU is shared (ZED SDK, robot stack)
+      - XLA_FLAGS=--xla_gpu_enable_triton_gemm=false
+      - HMP_DEVICE=gpu                        # device of the prediction worker
+      - PYTHONPYCACHEPREFIX=/ros2_ws/pycache
+      - JAX_COMPILATION_CACHE_DIR=/ros2_ws/jax_cache_gpu
+      - JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0
+
+volumes:
+  ros2_ws:

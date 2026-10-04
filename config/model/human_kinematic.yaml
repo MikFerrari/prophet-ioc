@@ -1,0 +1,15 @@
+# 19-DOF kinematic predictor: horizon and the INITIAL cost weights of the IOC fit (train.py: restart 0 starts here; the
+# fitted weights of output/latest_train are the ones eval.py, goal_inference.py and the ROS 2 node use).
+# HumanKinematicParams fields not listed keep their defaults: unit effort weights of the reaching arm, w_act_* group
+# weights 3/3/3/2, no running target cost.
+horizon: 14             # prediction steps from t_obs to the expected arrival
+max_iter: 3             # gILQR iterations of the prediction
+action_cost: 1.0e-4
+velocity_cost: 1.0e-2   # terminal wrist velocity
+posture_cost: 1.0e-3
+running_vel_cost: 1.0e-2
+base_disp_cost: 10.0    # pelvis displacement
+w_target: 100.0         # terminal target cost (sets the cost scale, not fitted)
+motor_noise: 0.1        # signal-dependent motor noise
+pred_noise: 0.8         # joint-velocity noise of the prediction covariance with the initial weights (train.py calibrates
+                        # it for the fitted weights)

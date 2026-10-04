@@ -1,0 +1,5 @@
+# example.py: parameters of the simulated reaching arm
+action_cost: 1.0e-4
+velocity_cost: 1.0e-2
+motor_noise: 0.1
+obs_noise: 1.0
