@@ -168,5 +168,6 @@ jax_cache/
 
 # Claude
 .claude/
+
 # Cached CARI v2 datasets (datasets/build_cari_v2_head_centroid.py)
 /cache/*.pkl

@@ -20,6 +20,7 @@ switched-off terms), with parallel restarts of projected Adam in log10 space; th
 
 import json
 import logging
+import os
 import threading
 import time
 from datetime import datetime
@@ -575,6 +576,12 @@ def _compile_estimate(records: List[Dict], key: Dict, size_mb: Optional[float], 
 def _wait_with_progress(fn, desc: str, estimate: Optional[float]):
     """fn() while a progress bar shows the elapsed time against the estimate (s; elapsed only if None) and the RAM
     of the process. Returns (result, seconds)."""
+    if os.environ.get("PROPHET_PROGRESS", "1") == "0":   # no progress thread (diagnostics): fn() and its duration
+        t0 = time.perf_counter()
+        out = fn()
+        dt = time.perf_counter() - t0
+        print(f"{desc}: done in {dt:.0f} s", flush=True)
+        return out, dt
     try:
         from resources import memory
     except ImportError:

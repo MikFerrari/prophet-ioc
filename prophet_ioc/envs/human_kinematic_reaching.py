@@ -176,10 +176,15 @@ def gauss_newton_sq(residual_fn, x: jnp.ndarray) -> jnp.ndarray:
     2 J0^T J0 >= 0. The dropped term can be negative far from the goal: for r = sin(x) - g with g = 0 at x = pi/2
     the full second derivative of r^2 is 2 cos^2 x - 2 sin^2 x = -2, which would make Q_xx indefinite; it vanishes at
     the goal (r = 0), so the Gauss-Newton and exact Hessians agree at a perfect reach.
+
+    jax.jvp, not jax.linearize: the same r0 + J0 (x - x0) (bit for bit), but nested inside the jacfwd(grad) of the
+    cost quadratization, vmap and the unrolled solver, jax.linearize goes through JAX's fallback linearize rule
+    (_lift_linearized), where the IOC fit crashed the interpreter (segmentation fault / illegal instruction while
+    tracing, JAX 0.11.2, Python 3.14, on one of two machines).
     """
     x0 = jax.lax.stop_gradient(x)
-    r0, jvp = jax.linearize(residual_fn, x0)
-    r = jax.lax.stop_gradient(r0) + jvp(x - x0)
+    r0, dr = jax.jvp(residual_fn, (x0,), (x - x0,))
+    r = jax.lax.stop_gradient(r0) + dr
     return jnp.sum(r**2)
 
 
