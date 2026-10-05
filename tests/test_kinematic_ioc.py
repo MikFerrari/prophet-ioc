@@ -20,16 +20,18 @@ def _random_state(env, rng, scale=0.1):
 
 
 def test_effort_weights_per_group():
-    """One effort weight per joint group; the arm groups follow the reaching hand (also traced, reaching_hand any)."""
+    """One effort weight per joint group; the arm groups follow the reaching hand, through the traced reaching flags
+    alpha_right / alpha_left (dual mode)."""
     p = HumanKinematicParams(w_act_pelvis=1.0, w_act_trunk=2.0, w_act_spine=3.0, w_act_reach_arm=4.0,
                              w_act_passive_arm=5.0, w_act_head=6.0, w_act_legs=7.0)
     expected = {"right": [1] * 3 + [2] * 3 + [3] * 3 + [4] * 4 + [5] * 4 + [6] * 2,
                 "left": [1] * 3 + [2] * 3 + [3] * 3 + [5] * 4 + [4] * 4 + [6] * 2}
     for hand in ("right", "left"):
         assert np.allclose(HumanKinematicReaching(reaching_hand=hand).action_weights(p), expected[hand])
-        env_any = HumanKinematicReaching(reaching_hand="any")
-        env_any.right_hand = jnp.float32(1.0 if hand == "right" else 0.0)
-        assert np.allclose(env_any.action_weights(p), expected[hand])
+        env_flags = HumanKinematicReaching(reaching_hand="right")     # the flags, not the static hand, switch the arms
+        env_flags.alpha_right = jnp.float32(1.0 if hand == "right" else 0.0)
+        env_flags.alpha_left = jnp.float32(1.0 - env_flags.alpha_right)
+        assert np.allclose(env_flags.action_weights(p), expected[hand])
     full = HumanKinematicReaching(mode="full_body").action_weights(p)
     assert full.shape == (27,) and np.allclose(full[19:], 7.0)
     # effort term of the running cost: 0.5 sum_j w_g(j) u_j^2 (everything else zero at the reference, at rest)

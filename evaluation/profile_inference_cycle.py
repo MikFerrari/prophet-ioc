@@ -126,6 +126,7 @@ def main():
         for _ in range(args.runs):
             t0 = time.perf_counter()
             x0, P0, q_chest_ref = hp.handover_state(np.asarray(hist, dtype=np.float32), body_params, args.dt, params.damping)
+            P0 = P0 * float(params.handover_cov_scale)
             times_kalman.append((time.perf_counter() - t0) * 1000.0)
 
         times_rollout = []

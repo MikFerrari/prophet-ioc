@@ -28,6 +28,8 @@ import jax.numpy as jnp
 from jax import lax, vmap
 
 from prophet_ioc.control import glqr, ilqr, make_lqg_approx
+from prophet_ioc.control.spec import make_lqr_approx
+from prophet_ioc.envs.zoh import zoh_noise_cov
 from prophet_ioc.control.lqr import Gains
 from prophet_ioc.envs import Env
 
@@ -45,6 +47,10 @@ def backward(env: Env, X: jnp.ndarray, U: jnp.ndarray, params: Any, eps: Optiona
     DEFAULT_EPS."""
     if eps is None:
         eps = DEFAULT_EPS if env.reg_eps is None else env.reg_eps
+    if getattr(env, "joint_signal_noise", False):
+        # closed-form noise terms (glqr.backward_joint_signal_noise): no noise Jacobians, O(n) per step
+        return glqr.backward_joint_signal_noise(make_lqr_approx(env, params)(X, U), U, params.motor_noise,
+                                                zoh_noise_cov(env.dt), eps=eps, psd_projection=False)
     return glqr.backward(make_lqg_approx(env, params)(X, U), eps=eps, psd_projection=False)
 
 

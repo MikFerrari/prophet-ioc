@@ -204,3 +204,65 @@ def test_pelvis_root_bone_length_conservation():
 
         assert np.isclose(upper_arm_len, 0.30, atol=1e-4), f"Upper arm stretched: {upper_arm_len} m"
         assert np.isclose(forearm_len, 0.30, atol=1e-4), f"Forearm stretched: {forearm_len} m"
+
+
+def _fast_path_case():
+    """A reaching environment and a trajectory with both wrist goals, the running wrist term and joint limits active."""
+    from prophet_ioc.envs.human_kinematic_reaching import HumanKinematicParams
+    env = HumanKinematicReaching(reaching_hand="both", dt=0.05, dt_scaled_cost=True)
+    params = HumanKinematicParams(running_target_cost=0.06, velocity_cost=1e-3, running_vel_cost=1e-4,
+                                  motor_noise=0.3, motor_noise_add=0.05)
+    T = 8
+    X = jnp.vstack([env.x0] * (T + 1)) + 0.05 * jax.random.normal(jax.random.PRNGKey(0), (T + 1, env.state_shape[0]))
+    X = X.at[3, 3:6].set(jnp.array([0.9, 0.5, 0.3]))      # chest rotation beyond its limit
+    X = X.at[:, 12].add(1.5)                               # an arm joint beyond its limit
+    U = 0.5 * jax.random.normal(jax.random.PRNGKey(1), (T, env.action_shape[0]))
+    return env, params, X, U
+
+
+def test_fast_quadratization_matches_autodiff():
+    """quadratize_cost (structure of the cost) = make_lqr_approx's jacfwd(grad), values and derivatives."""
+    from prophet_ioc.control.spec import make_lqr_approx
+    env, params, X, U = _fast_path_case()
+
+    def spec(fast, X, p):
+        HumanKinematicReaching.fast_quadratization = fast
+        return make_lqr_approx(env, p)(X, U)
+
+    try:
+        ref, new = spec(False, X, params), spec(True, X, params)
+        for name in ref._fields:
+            a, b = np.asarray(getattr(ref, name)), np.asarray(getattr(new, name))
+            np.testing.assert_allclose(b, a, rtol=1e-4, atol=1e-5 * max(1.0, np.abs(a).max()), err_msg=name)
+        scalar = lambda fast, X, p: sum(jnp.sum(jnp.sin(getattr(spec(fast, X, p), f)))
+                                        for f in ("Q", "q", "R", "r", "Qf", "qf"))
+        gX0, gp0 = jax.grad(lambda X, p: scalar(False, X, p), argnums=(0, 1))(X, params)
+        gX1, gp1 = jax.grad(lambda X, p: scalar(True, X, p), argnums=(0, 1))(X, params)
+        np.testing.assert_allclose(gX1, gX0, rtol=1e-4, atol=1e-5 * float(jnp.abs(gX0).max()))
+        for k in ("velocity_cost", "base_disp_cost", "running_target_cost", "w_act_reach_arm", "w_lim"):
+            np.testing.assert_allclose(getattr(gp1, k), getattr(gp0, k), rtol=1e-3, atol=1e-8, err_msg=k)
+    finally:
+        HumanKinematicReaching.fast_quadratization = True
+
+
+def test_joint_signal_noise_backward_matches_generic():
+    """glqr.backward_joint_signal_noise (closed-form noise terms) = glqr.backward on the full LQG spec."""
+    from prophet_ioc.control import ilqr_unrolled
+    env, params, X, U = _fast_path_case()
+
+    def gains(flag):
+        HumanKinematicReaching.joint_signal_noise = flag
+        return ilqr_unrolled.backward(env, X, U, params)
+
+    try:
+        ref, new = gains(False), gains(True)
+        for k in ("L", "l", "H"):
+            a, b = np.asarray(getattr(ref, k)), np.asarray(getattr(new, k))
+            np.testing.assert_allclose(b, a, rtol=1e-4, atol=1e-5 * max(1.0, np.abs(a).max()), err_msg=k)
+        obj = lambda flag, p: jnp.sum(gains(flag).L ** 2) + jnp.sum(gains(flag).l ** 2)
+        g0 = jax.grad(lambda p: obj(False, p))(params)
+        g1 = jax.grad(lambda p: obj(True, p))(params)
+        for k in ("velocity_cost", "running_target_cost", "w_act_reach_arm", "motor_noise"):
+            np.testing.assert_allclose(getattr(g1, k), getattr(g0, k), rtol=1e-3, atol=1e-8, err_msg=k)
+    finally:
+        HumanKinematicReaching.joint_signal_noise = True

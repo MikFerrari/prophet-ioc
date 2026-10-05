@@ -1,5 +1,10 @@
 # PROPHET: PRObabilistic Partially-observable Human Estimation Toolkit
 
+# TEMP:
+```bash
+python train.py ioc.objective=open_loop 'data.instructions=[1, 3, 5]' 'data.velocities=[FAST]'
+```
+
 **Uncertainty-Aware Human Reaching Prediction via Inverse Optimal Control on an Anthropomorphic Kinematic Model**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)

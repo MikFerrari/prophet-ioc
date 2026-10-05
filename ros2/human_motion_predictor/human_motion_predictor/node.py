@@ -115,6 +115,8 @@ class HumanMotionPredictor(Node):
         self.frame_id = p("frame_id", "").value              # "" = frame of the input messages
         self.warmup = p("warmup", True).value
         self.world_frame = p("world_frame", "").value       # "" = keep the frame of the ZED message
+        self.warm_start = bool(p("warm_start", True).value)   # solves start from the previous tick's plans
+        self.warm_max_iter = int(p("warm_max_iter", 2).value)  # solver iterations of the warm-started ticks
         head_keypoint = p("head_keypoint", "nose").value    # as data.head_keypoint of the weights: nose | centroid (of nose
                                                             # and ears) | ears (midpoint, as human_kinematics_ros)
         joint_limits = p("joint_limits", "cari").value      # cari (+-pi, IK of the CARI dataset) | model (anatomical)
@@ -164,7 +166,8 @@ class HumanMotionPredictor(Node):
             "params": {k: float(v) for k, v in model_params.items()}, "H": self.H, "max_iter": self.max_iter,
             "tol": self.tol, "settings": dict(vars(self.settings)), "grasp_offset": float(self.grasp_offset),
             "pred_noise": self.pred_noise, "horizon": self.prediction_time, "nominal_duration": self.nominal_duration,
-            "stop_time": self.stop_time, "times": self.times.tolist(),
+            "stop_time": self.stop_time, "times": self.times.tolist(), "warm_start": self.warm_start,
+            "warm_max_iter": self.warm_max_iter,
             "filter": {"switch_rate": filter_cfg["switch_rate"], "evidence_lag": filter_cfg["evidence_lag"],
                        "temperature": filter_cfg["evidence_temperature"], "obs_noise": filter_cfg["evidence_obs_noise"]},
             "kappa_heading": self.kappa_heading, "kappa_gaze": self.kappa_gaze, "device": self.device,

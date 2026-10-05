@@ -367,7 +367,7 @@ def _with_start(env: HumanKinematicReaching, x0: jnp.ndarray) -> HumanKinematicR
 
 def predictive_distribution(env: HumanKinematicReaching, x_prefix: jnp.ndarray, P0: jnp.ndarray,
                             params: HumanKinematicParams, settings: PredictionSettings, H: int, max_iter: int,
-                            tol: Optional[float] = None) -> Dict[str, jnp.ndarray]:
+                            tol: Optional[float] = None, U_init: Optional[jnp.ndarray] = None) -> Dict[str, jnp.ndarray]:
     """Predictive distribution of the state over H steps of env.dt from the handover (traceable: jit / vmap).
 
     x_prefix (n+1, d): the estimated states of the history on the prediction grid, the last one the handover estimate
@@ -388,10 +388,12 @@ def predictive_distribution(env: HumanKinematicReaching, x_prefix: jnp.ndarray, 
     prediction."""
     d, n_u = x_prefix.shape[-1], env.n_dof
     prop = propagation_params(params, settings)
-    U0 = jnp.zeros((H, n_u), dtype=x_prefix.dtype)
+    # initial controls of the solve: zeros, or a warm start (U_init (H, n_u): the previous plan shifted to this
+    # prediction's time grid, shift_plan); the solver iterates from it as from zeros
+    U0 = jnp.zeros((H, n_u), dtype=x_prefix.dtype) if U_init is None else jnp.asarray(U_init, dtype=x_prefix.dtype)
     if settings.observability == "full":
         gains, X, U = ilqr_unrolled.solve(env, x_prefix[-1], U0, params, max_iter=max_iter, tol=tol)
-        out = dict(mean=X, nominal=X, L=gains.L)
+        out = dict(mean=X, nominal=X, L=gains.L, U=U)
         if settings.model_covariance:
             policy = _plan_policy(gains, X, U, settings.temperature)
             out["Sigma"] = closed_loop_moments(env, policy, prop, X, P0)
@@ -418,7 +420,7 @@ def predictive_distribution(env: HumanKinematicReaching, x_prefix: jnp.ndarray, 
     K = filter_gains(env_f, X, U, params, P_agent)       # the agent's filter along its new plan (its own noises)
     model = SolvedModel(policy, create_filtered_joint_dynamics(env_f, K))
     mu, Sigma = joint_predictive_moments(env_f, model, prop, mu0, S0, H)
-    return dict(mean=mu[:, :d], nominal=X, L=gains.L, Sigma=Sigma[:, :d, :d])
+    return dict(mean=mu[:, :d], nominal=X, L=gains.L, Sigma=Sigma[:, :d, :d], U=U)
 
 
 _COV_PARTS = ("wrist", "elbow", "passive_wrist")
@@ -428,7 +430,7 @@ def _prediction_outputs(env: HumanKinematicReaching, dist: Dict[str, jnp.ndarray
     """Keypoints along the predicted mean and the wrist / elbow / other-wrist covariances J Sigma J^T (model
     covariance) or the FK Jacobians (random walk, propagated on the host)."""
     kp, chest, Jw, Je, Jp = _kinematic_outputs(env, dist["mean"])
-    out = dict(mean=dist["mean"], kp=kp, chest=chest, L=dist["L"])
+    out = dict(mean=dist["mean"], kp=kp, chest=chest, L=dist["L"], U=dist["U"])
     jac = dict(zip(_COV_PARTS, (Jw, Je, Jp)))
     if settings.random_walk:
         out["jac"] = jac
@@ -441,21 +443,40 @@ def _prediction_outputs(env: HumanKinematicReaching, dist: Dict[str, jnp.ndarray
 
 @partial(jax.jit, static_argnames=("settings", "H", "max_iter", "tol"))
 def _predict_one(env, x_prefix, P0, params, settings: PredictionSettings, H: int, max_iter: int,
-                 tol: Optional[float] = None):
+                 tol: Optional[float] = None, U_init: Optional[jnp.ndarray] = None):
     """predictive_distribution and its keypoint outputs for one environment (compiled once per hand, settings and
-    history length)."""
-    return _prediction_outputs(env, predictive_distribution(env, x_prefix, P0, params, settings, H, max_iter, tol),
-                               settings)
+    history length, and with / without a warm start U_init)."""
+    return _prediction_outputs(env, predictive_distribution(env, x_prefix, P0, params, settings, H, max_iter, tol,
+                                                            U_init), settings)
 
 
 @partial(jax.jit, static_argnames=("settings", "H", "max_iter", "tol"))
 def _predict_batch(envs, x_prefix, P0, params, settings: PredictionSettings, H: int, max_iter: int,
-                   tol: Optional[float] = None):
+                   tol: Optional[float] = None, U_init: Optional[jnp.ndarray] = None):
     """_predict_one over a batch of environments (leading axis) and their prefixes x_prefix (B, n+1, d), with the
-    same handover covariance P0 (with tol, the batch solves stop when every element has converged)."""
-    one = lambda env, xp: _prediction_outputs(env, predictive_distribution(env, xp, P0, params, settings, H,
-                                                                            max_iter, tol), settings)
-    return jax.vmap(one)(envs, x_prefix)
+    same handover covariance P0 (with tol, the batch solves stop when every element has converged); U_init (B, H, n_u):
+    warm starts (None: zeros)."""
+    if U_init is None:
+        one = lambda env, xp: _prediction_outputs(env, predictive_distribution(env, xp, P0, params, settings, H,
+                                                                                max_iter, tol), settings)
+        return jax.vmap(one)(envs, x_prefix)
+    one = lambda env, xp, u0: _prediction_outputs(env, predictive_distribution(env, xp, P0, params, settings, H,
+                                                                                max_iter, tol, u0), settings)
+    return jax.vmap(one)(envs, x_prefix, U_init)
+
+
+def shift_plan(plan: Tuple[float, float, np.ndarray], t_now: float, dt: float, H: int) -> np.ndarray:
+    """Warm start (H, n_u) for a solve starting at t_now with step dt: the zero-order-hold controls U (H_prev, n_u) of
+    a previous plan (t_start, dt_prev, U) sampled at the middle of each new step; zero after its end (or before its
+    start). The controls are joint accelerations, so the shift is exact up to the change of the chest rotation-vector
+    origin between the two handovers (small over one tick); the solver corrects the rest."""
+    t0, dt0, U = plan
+    U = np.asarray(U, dtype=np.float32)
+    k = np.floor((t_now + (np.arange(H) + 0.5) * dt - t0) / dt0).astype(int)
+    out = np.zeros((H, U.shape[1]), dtype=np.float32)
+    ok = (k >= 0) & (k < len(U))
+    out[ok] = U[k[ok]]
+    return out
 
 
 def _history_prefix(settings: PredictionSettings, q28_history: np.ndarray, body_params: np.ndarray, dt: float,
@@ -582,6 +603,7 @@ def predict_motion(q28_history: np.ndarray, dt: float, body_params: np.ndarray, 
     dt_sim = t_pred / H
 
     x0, P0, q_chest_ref = handover_state(q28_history, body_params, dt, params.damping)
+    P0 = P0 * float(params.handover_cov_scale)   # calibrated scale of the handover covariance (train.py stage 2)
     env = make_reaching_env(body_params, legs, x0[:19], q_chest_ref, target, dt_sim, hand,
                             target_left=target_left, alpha_right=alpha_right, alpha_left=alpha_left)
     env.x0 = jnp.asarray(x0, dtype=jnp.float32)
@@ -654,6 +676,7 @@ class HypothesisPrediction:
     arrival: float
     temporary: bool
     goal: Optional[np.ndarray] = None
+    plan: Optional[Tuple[float, float, np.ndarray]] = None   # (t_start, dt, U (H, n_u)): warm start of the next tick
 
 
 @dataclass
@@ -740,8 +763,9 @@ def wrist_goal(position: np.ndarray, wrist: np.ndarray, grasp_offset: float = 0.
 def predict_hypotheses(q28_history: np.ndarray, dt: float, body_params: np.ndarray, hypotheses: List[Hypothesis],
                        params: HumanKinematicParams, H: int, max_iter: int, horizon: float, nominal_duration: float,
                        legs_nominal: Optional[np.ndarray] = None, stop_time: float = 0.3, tol: Optional[float] = None,
-                       settings: Optional[PredictionSettings] = None, grasp_offset: float = 0.0
-                       ) -> Tuple[List[HypothesisPrediction], HandState]:
+                       settings: Optional[PredictionSettings] = None, grasp_offset: float = 0.0,
+                       warm_start: Optional[Dict[Tuple[str, str], Tuple[float, float, np.ndarray]]] = None,
+                       t_now: Optional[float] = None) -> Tuple[List[HypothesisPrediction], HandState]:
     """Receding-horizon prediction of every hypothesis from a 28-DOF joint history (n, 28) sampled every dt.
 
     Shared Kalman handover state; per hypothesis, its wrist goal (wrist_goal: the goal location, or grasp_offset m
@@ -751,7 +775,12 @@ def predict_hypotheses(q28_history: np.ndarray, dt: float, body_params: np.ndarr
     rest in stop_time s (free end position of the minimum-jerk stop: p0 + v0 T / 2 + a0 T^2 / 12). All hypotheses are
     predicted together (predictive_distribution with `settings`, default PredictionSettings(); vmap over both hands,
     compiled once per number of hypotheses), with at most max_iter solver iterations and early stopping at tolerance
-    tol (None: exactly max_iter)."""
+    tol (None: exactly max_iter).
+
+    warm_start: {(hypothesis name, hand): plan} of the previous tick (HypothesisPrediction.plan), with t_now the time
+    of this prediction (same clock as the plans): each solve starts from the previous plan shifted to the new time
+    grid (shift_plan) instead of zero controls, so that with tol it converges in fewer iterations. Hypotheses without
+    a plan start from zeros. The returned predictions carry their plans for the next tick."""
     settings = settings or PredictionSettings()
     q28_history = np.asarray(q28_history, dtype=np.float32)
     body_params = np.asarray(body_params, dtype=np.float32)
@@ -763,6 +792,7 @@ def predict_hypotheses(q28_history: np.ndarray, dt: float, body_params: np.ndarr
         hs.wrist_vel[side], hs.wrist_acc[side] = _wrist_derivatives(w, dt)
     legs = q28_history[0][18:26] if legs_nominal is None else np.asarray(legs_nominal)
     x0, P0, q_chest_ref = handover_state(q28_history, body_params, dt, params.damping)
+    P0 = P0 * float(params.handover_cov_scale)   # calibrated scale of the handover covariance (train.py stage 2)
     specs = []
     for hyp in hypotheses:
         p0, v0, a0 = hs.wrist[hyp.hand], hs.wrist_vel[hyp.hand], hs.wrist_acc[hyp.hand]
@@ -786,10 +816,22 @@ def predict_hypotheses(q28_history: np.ndarray, dt: float, body_params: np.ndarr
     envs = reaching_env_batch(body_params, legs, x0, q_chest_ref, targets, target_vels, t_preds / H,
                               [h.hand for h in hypotheses])
     x_prefix = _history_prefix(settings, q28_history, body_params, dt, params.damping, x0, q_chest_ref, t_preds / H)
+    dts = t_preds / H
+    U_init = None
+    if warm_start is not None and t_now is not None:
+        U_init = np.zeros((len(hypotheses), H, len(x0) // 2), dtype=np.float32)
+        for i, h in enumerate(hypotheses):
+            plan = warm_start.get((h.name, h.hand))
+            if plan is not None:
+                U_init[i] = shift_plan(plan, float(t_now), float(dts[i]), H)
+        U_init = jnp.asarray(U_init)
     out = _predict_batch(envs, jnp.asarray(x_prefix), jnp.asarray(P0, dtype=jnp.float32), params, settings, H,
-                         max_iter, tol)
+                         max_iter, tol, U_init)
     preds = _assemble(out, P0, t_preds, settings, params.damping)
-    out = [HypothesisPrediction(h, p, targets[i], target_vels[i], float(arrivals[i]), bool(temporary[i]), goals[i])
+    U_plan = np.asarray(jax.device_get(out["U"]))
+    t_start = None if t_now is None else float(t_now)
+    out = [HypothesisPrediction(h, p, targets[i], target_vels[i], float(arrivals[i]), bool(temporary[i]), goals[i],
+                                None if t_start is None else (t_start, float(dts[i]), U_plan[i]))
            for i, (h, p) in enumerate(zip(hypotheses, preds))]
     return out, hs
 

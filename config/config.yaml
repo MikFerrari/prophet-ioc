@@ -27,23 +27,34 @@ ioc:                   # train.py: IOC fit on the complete reaches of the traini
   temperature: 1.0e-6   # max-ent policy u ~ N(ubar + l + L (x - xbar), temperature H^-1) (fixed, paper reaching task);
                         # 0 = deterministic policy (no policy noise in the likelihood)
   likelihood_block: full  # full state | velocity (fallback: score only the joint velocities)
-  solve_iters: 8        # unrolled gILQR iterations per window (likelihood with solve, open_loop)
+  solve_iters: 3        # unrolled gILQR iterations per window (likelihood with solve, open_loop)
   checkpoint: true      # jax.checkpoint of the solver iterations and of each window: reverse-mode memory O(batch) instead
                         # of O(windows) (the likelihood fit needs it on an 8 GB GPU); offline fit only, not the online solve
   params: null          # inferred parameters, null = cari_kinematic.fit_param_names (the learnable weights of
                         # config/model + residual_noise for the likelihood, + obs_noise when partially observed)
-  T_fit: 30             # steps of a training window, from its start (each of data.obs_ratios, the handover points of
+  T_fit: 14             # steps of a training window, from its start (each of data.obs_ratios, the handover points of
                         # eval.py) to the end of the reach
   restarts: 4           # parallel restarts (restart 0 starts from the initial weights of config/model)
-  max_iter: 150         # projected Adam iterations in log10 space
-  lr: 0.05              # Adam step (log10 units)
-  patience: 20          # stop when the best loss improved by less than tol (relative) over patience iterations
+  max_iter: 200         # projected Adam iterations in log10 space
+  lr: 0.1              # Adam step (log10 units)
+  patience: 30          # stop when the best loss improved by less than tol (relative) over patience iterations
   tol: 1.0e-3
   batch_size: null      # windows per batch inside a restart (lower = less GPU memory); null = 16 (open_loop) or 2
                         # (likelihood) windows on the GPU at once, divided by the restarts (at least 1)
   seed: 0
   device: gpu
   output_dir: null      # null = output/train_<timestamp>
+  noise_fit:            # open_loop only, stage 2: the noise of the predictive distribution, cost weights fixed
+    enabled: true       #   (the open-loop objective fits no noise: the predictive covariance would keep the initial
+                        #   residual noise and be inflated)
+    objective: predictive  # predictive: likelihood of the recorded wrist / elbow positions under the published
+                        #   predictive distribution (predictions from data.obs_ratios of the training reaches, as
+                        #   eval.py; CPU, no extra compilation) | likelihood: one-step IOC likelihood (GPU compilation)
+    params: null        # predictive: null = [residual_noise, handover_cov_scale]; likelihood: null = residual_noise
+                        #   (+ obs_noise when ioc.observability is partial)
+    restarts: 1         # likelihood only
+    max_iter: 60        # likelihood only
+    batch_size: null    # likelihood only: null = the likelihood default (ioc.batch_size)
   resources:            # evaluation/resources.py: memory watchdog, priority and CPUs of the training process
     max_ram_gb: null    # stop the run above this process RAM; null = max_ram_fraction of the physical RAM
     max_ram_fraction: 0.8  # per-process cap; the system check below is the main protection (an open-loop fit on 237
@@ -63,6 +74,8 @@ wandb:                  # experiment tracking (evaluation/tracking.py) of train.
 eval:                   # eval.py: predictions of the held-out test subjects
   params: output/latest_train   # train.py run (IOC-fitted weights, calibrated noise); null = initial weights of config/model
   compare_initial: true         # also evaluate the initial weights (method kin_init), for reference
+  hand: known                   # reaching hand of the kinematic model: known (the dataset's, as every baseline) |
+                                # inferred (detected from the observed motion; right / left / both)
   baselines: [promp, dmp]       # data-driven baselines (prophet_ioc.baselines) learned once from the complete reaches of
                                 # the training subjects (never the test subjects); [] = none.
                                 # promp: ProMP (Paraschos 2013) conditioned on the prefix and the wrist goal (+ 95 % coverage)
@@ -71,7 +84,7 @@ eval:                   # eval.py: predictions of the held-out test subjects
     promp: {n_basis: 12, cov_reg: 0.03, n_cond: 10, phase: given}           # phase: given | ml
     dmp: {n_basis: 30, goal_model: regression, infer_goal: true, phase: continue}  # goal_model: regression | mean;
                                                                             # phase: continue | restart
-  plot_trials: [sub_13/1, sub_13/5]  # trials (subject/instruction) with 3D html figures and frames
+  plot_trials: [sub_13/1, sub_13/3, sub_13/5]  # trials (subject/instruction) with 3D html figures and frames
   device: cpu           # many small sequential solves: faster on the CPU
   output_dir: null      # null = output/eval_<run> of the weights output/train_<run> (eval_initial_<timestamp> for the
                         # initial weights; _2, _3, ... if it exists); obs<XX>/ per observed fraction, figures/
@@ -91,6 +104,8 @@ online:                 # evaluation/goal_inference.py: online prediction replay
   observation_time: 1.0 # s of measurements observed
   samples: 30           # uniform samples of the observation window
   rate: 15.0            # predictions per second
+  warm_start: true      # each tick's solves start from the previous tick's plans (as the ROS 2 node, engine.py)
+  warm_max_iter: 2      # solver iterations of the warm-started ticks (the first tick: model.max_iter, from zero)
   angles: raw           # raw (IK of the raw keypoints, as online) | filt (centred-filtered, non-causal)
   device: gpu
   reuse: null           # output folder of a previous run: reuse its predictions (sessions.pkl), recompute tables / figures

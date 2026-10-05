@@ -61,8 +61,11 @@ def test_env_batch_matches_single_environments():
                             settings, 10, 10)   # converged: float32 rounding
     X = out["mean"]
     for b in range(2):
-        env = hp.make_reaching_env(BODY, np.zeros(8), x0[:19], q_ref, targets[b], dts[b], ["right", "left"][b])
+        # the batch's convention for the left goal: the hypothesis' target (reaching_env_batch: targets_left default)
+        env = hp.make_reaching_env(BODY, np.zeros(8), x0[:19], q_ref, targets[b], dts[b], ["right", "left"][b],
+                                   target_left=targets[b])
         env.target_vel = jnp.asarray(vels[b], dtype=jnp.float32)
+        env.target_vel_left = env.target_vel       # the batch's convention (target_vels_left default)
         env.x0 = jnp.asarray(x0)
         single = jax.tree.map(lambda leaf, i=b: leaf[i], batch)
         for a, c in zip(jax.tree.leaves(env), jax.tree.leaves(single)):

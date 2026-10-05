@@ -43,6 +43,49 @@ def backward(spec: LQGSpec, eps: float = 1e-4, psd_projection: bool = True) -> l
     return lqr.Gains(L=L, l=l, H=H)
 
 
+def backward_joint_signal_noise(spec, U: jnp.ndarray, sigma_m, M: jnp.ndarray, eps: float = 1e-4,
+                                psd_projection: bool = False) -> lqr.Gains:
+    """backward() for the dynamics noise of the joint-space models: state [q; qd] with n joints and n inputs, and a
+    state-independent noise of covariance sigma_m^2 u_j^2 M on the (q_j, qd_j) pair of each input j (M the 2 x 2
+    zero-order-hold covariance, plus additive noise that does not depend on u). Then Cx = 0 and every input's noise
+    column is proportional to one joint, so the generalized terms of backward() reduce to
+        sum_i Cu_i^T S Cu_i = diag(d),   sum_i Cu_i^T S V_i = d * u,   all Cx terms = 0,
+        d_j = sigma_m^2 (M00 S[j, j] + 2 M01 S[j, n + j] + M11 S[n + j, n + j])
+    (O(n) per step instead of O(noise channels x n^3)); same gains as backward() on the full LQG spec, up to
+    floating-point rounding. spec: an LQRSpec (Q, q, P, R, r, A, B, Qf, qf); U (T, n) the nominal inputs."""
+    n = U.shape[-1]
+    idx = jnp.arange(n)
+
+    def loop(carry, step):
+        S, s = carry
+        Q, q, P, R, r, A, B, u = step
+        d = sigma_m ** 2 * (M[0, 0] * S[idx, idx] + 2.0 * M[0, 1] * S[idx, n + idx] + M[1, 1] * S[n + idx, n + idx])
+        H = R + B.T @ S @ B + jnp.diag(d)
+        H = 0.5 * (H + H.T)
+        G = P + B.T @ S @ A
+        g = r + B.T @ s + d * u
+
+        evals, _ = jnp.linalg.eigh(H)
+        Ht = H + jnp.maximum(0., eps - evals[0]) * jnp.eye(H.shape[0])
+
+        L = -jnp.linalg.solve(Ht, G)
+        l = -jnp.linalg.solve(Ht, g)
+
+        Sn = Q + A.T @ S @ A + L.T @ Ht @ L + L.T @ G + G.T @ L
+        Sn = 0.5 * (Sn + Sn.T)
+        sn = q + A.T @ s + G.T @ l + L.T @ Ht @ l + L.T @ g
+
+        if psd_projection:
+            s_evals, s_evecs = jnp.linalg.eigh(Sn)
+            Sn = s_evecs @ jnp.diag(jnp.maximum(0., s_evals)) @ s_evecs.T
+
+        return (Sn, sn), (L, l, Ht)
+
+    _, (L, l, H) = lax.scan(loop, (spec.Qf, spec.qf), (spec.Q, spec.q, spec.P, spec.R, spec.r, spec.A, spec.B, U),
+                            reverse=True)
+    return lqr.Gains(L=L, l=l, H=H)
+
+
 def simulate(key: random.PRNGKey,
              spec: LQGSpec, x0: jnp.ndarray,
              gains: lqr.Gains = None, eps: float = 1e-8) -> Tuple[jnp.ndarray, jnp.ndarray]:

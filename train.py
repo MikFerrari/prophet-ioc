@@ -16,6 +16,12 @@ instruction of every training subject is a demonstration (complete reach).
   so that 95 % of the wrist / elbow prediction errors of the training subjects fall in the 95 % ellipsoids
   (leave-one-subject-out among them; the value for a new person is the pooled one), and the coverage of the model
   covariance on the same errors is reported.
+- Two stages for ioc.objective = open_loop (ioc.noise_fit): the open-loop objective fits the cost weights only, so the
+  noise of the predictive distribution is fitted next, with those weights held fixed; otherwise the residual noise
+  keeps its initial value and the predicted covariance is inflated. noise_fit.objective: predictive (default:
+  residual_noise and handover_cov_scale maximize the likelihood of the recorded wrist / elbow positions under the
+  published predictive distribution, ck.fit_predictive_noise, seconds after one pass of predictions) | likelihood
+  (residual_noise, + obs_noise when partially observed, by the one-step IOC likelihood).
 Resources (ioc.resources, evaluation/resources.py): lower priority, a few cores left free and a memory watchdog that
 stops the run (exit code 137, with the reason) when its RAM exceeds ioc.resources.max_ram_gb (default 80 % of the
 physical RAM) or the system's available RAM falls below ioc.resources.min_available_gb, before the machine swaps.
@@ -104,25 +110,27 @@ def main(cfg: DictConfig):
 
     tracker = Tracker(cfg.get("wandb"), "train", root.name, OmegaConf.to_container(cfg, resolve=True))
 
-    def log_iteration(it, rec):
-        """Per-iteration record of ck.fit_params -> wandb: loss and gradient norm of every restart, best loss,
-        weights of the best point (and of every restart, log10)."""
-        obj = cfg.ioc.objective
-        data = {
-            f"fit/{obj}_best_loss": rec["best_loss"],
-            "fit/best_loss": rec["best_loss"],
-            "fit/best_restart": rec["best_restart"],
-            "fit/iteration_time_s": rec["iteration_time_s"],
-            "fit/elapsed_min": rec["elapsed_s"] / 60.0,
-        }
-        for r, (v, gn) in enumerate(zip(rec["loss"], rec["grad_norm"])):
-            data[f"fit/{obj}_loss_restart{r}"] = v
-            data[f"fit/loss_restart{r}"], data[f"fit/grad_norm_restart{r}"] = v, gn
-        for i, k in enumerate(rec["infer"]):
-            data[f"params/{k}"] = 10.0 ** rec["best_log10_params"][i]
-            for r, th in enumerate(rec["log10_params"]):
-                data[f"log10_params_restart{r}/{k}"] = th[i]
-        tracker.log(data, step=it)
+    def make_logger(stage: str, obj: str, step0: int = 0):
+        """Per-iteration record of ck.fit_params -> wandb under stage/ (fit, noise_fit): loss and gradient norm of
+        every restart, best loss, weights of the best point (and of every restart, log10). step0: offset of the
+        steps (wandb steps must increase across the stages)."""
+        def log_iteration(it, rec):
+            data = {
+                f"{stage}/{obj}_best_loss": rec["best_loss"],
+                f"{stage}/best_loss": rec["best_loss"],
+                f"{stage}/best_restart": rec["best_restart"],
+                f"{stage}/iteration_time_s": rec["iteration_time_s"],
+                f"{stage}/elapsed_min": rec["elapsed_s"] / 60.0,
+            }
+            for r, (v, gn) in enumerate(zip(rec["loss"], rec["grad_norm"])):
+                data[f"{stage}/{obj}_loss_restart{r}"] = v
+                data[f"{stage}/loss_restart{r}"], data[f"{stage}/grad_norm_restart{r}"] = v, gn
+            for i, k in enumerate(rec["infer"]):
+                data[f"params/{k}"] = 10.0 ** rec["best_log10_params"][i]
+                for r, th in enumerate(rec["log10_params"]):
+                    data[f"log10_params_restart{r}/{k}"] = th[i]
+            tracker.log(data, step=step0 + it)
+        return log_iteration
 
     vel_meta = list(raw_vel) if not isinstance(raw_vel, str) else raw_vel
     info = {"objective": cfg.ioc.objective, "train_subjects": train_subjects, "test_subjects": test_subjects,
@@ -132,7 +140,8 @@ def main(cfg: DictConfig):
     if cfg.ioc.objective != "none":
         with jax.default_device(fit_device):
             params, fit_info = ck.fit_params(trials, base, cfg.ioc, cfg.model, cfg.data,
-                                             callback=log_iteration if tracker.enabled else None)
+                                             callback=make_logger("fit", cfg.ioc.objective) if tracker.enabled
+                                             else None)
         tracker.summary({"loss_base": fit_info["loss_base"], "loss_fit": fit_info["loss_fit"],
                          "iterations": fit_info["iterations"], "fit_time_min": fit_info["fit_time_s"] / 60.0,
                          **{f"fitted/{k}": ck.params_to_dict(params)[k] for k in fit_info["infer"]}})
@@ -145,6 +154,56 @@ def main(cfg: DictConfig):
             print(f"  {k:22s} {ck.params_to_dict(base)[k]:10.3g} {ck.params_to_dict(params)[k]:10.3g}")
         resources.release()   # the compiled objective (several GB of host RAM for the likelihood) is not needed any more
         print(f"  after the fit: {resources.status()}", flush=True)
+
+    # Stage 2 (open-loop fits): the noise levels of the predictive distribution by the likelihood, with the fitted cost
+    # weights held fixed. The open-loop objective fits no noise (the residual noise would keep its initial value and
+    # inflate the predicted covariance); the likelihood of the recorded transitions does.
+    nf = cfg.ioc.get("noise_fit") or {}
+    if cfg.ioc.objective == "open_loop" and nf.get("enabled", True) and str(nf.get("objective", "predictive")) == \
+            "predictive":
+        # predictive: residual noise and handover covariance scale maximize the likelihood of the recorded wrist and
+        # elbow positions under the predictive distribution the model publishes (open-loop predictions from every
+        # handover point of the training reaches, as eval.py), not the one-step transitions of the IOC likelihood
+        names = list(nf.get("params") or ck.PREDICTIVE_NOISE_PARAMS)
+        ratios = [float(x) for x in cfg.data.obs_ratios]
+        print(f"=== stage 2: noise levels ({', '.join(names)}) by the predictive likelihood of the wrist and elbow "
+              f"(predictions from {', '.join(f'{r:.0%}' for r in ratios)} observed of the {len(trials)} training "
+              f"reaches, CPU), cost weights of the open-loop fit held fixed", flush=True)
+        with jax.default_device(cpu):
+            params, noise_info = ck.fit_predictive_noise(trials, params, ratios, H, max_iter, tol,
+                                                         ck.predictor_settings(cfg, info), names)
+        info["noise_fit"] = noise_info
+        tracker.summary({f"fitted/{k}": v for k, v in noise_info["after"].items()})
+        print(f"  negative log-likelihood per sample: {noise_info['loss_base']:.4g} -> {noise_info['loss_fit']:.4g}; "
+              f"95 % coverage of the wrist / elbow (training reaches): {noise_info['coverage_before']:.0%} -> "
+              f"{noise_info['coverage_after']:.0%} ({noise_info['samples']} samples, {noise_info['fit_time_s']:.0f} s)")
+        for tag, v in noise_info["per_ratio"].items():
+            print(f"    {tag}: coverage {v['coverage_before']:.0%} -> {v['coverage_after']:.0%}")
+        for k in names:
+            print(f"  {k:22s} {noise_info['before'][k]:10.3g} {noise_info['after'][k]:10.3g}")
+    elif cfg.ioc.objective == "open_loop" and nf.get("enabled", True):
+        names = list(nf.get("params") or (["residual_noise"] + (["obs_noise"] if cfg.ioc.get("observability", "full")
+                                                                == "partial" else [])))
+        ncfg = OmegaConf.merge(cfg.ioc, OmegaConf.create({
+            "objective": "likelihood", "params": names, "restarts": int(nf.get("restarts", 1)),
+            "max_iter": int(nf.get("max_iter", 60)), "batch_size": nf.get("batch_size")}))
+        print(f"=== stage 2: noise levels ({', '.join(names)}) by the likelihood, cost weights of the open-loop fit "
+              f"held fixed ({ncfg.restarts} restart(s), at most {ncfg.max_iter} iterations)", flush=True)
+        before = ck.params_to_dict(params)
+        with jax.default_device(fit_device):
+            params, noise_info = ck.fit_params(trials, params, ncfg, cfg.model, cfg.data,
+                                               callback=make_logger("noise_fit", "likelihood",
+                                                                    step0=info.get("iterations", 0) + 1)
+                                               if tracker.enabled else None)
+        info["noise_fit"] = {k: noise_info[k] for k in ("infer", "loss_base", "loss_fit", "iterations", "fit_time_s",
+                                                         "best_restart", "loss_history") if k in noise_info}
+        tracker.summary({f"fitted/{k}": ck.params_to_dict(params)[k] for k in names})
+        print(f"  negative log-likelihood per segment: {noise_info['loss_base']:.4g} -> {noise_info['loss_fit']:.4g} "
+              f"({noise_info['iterations']} iterations, {noise_info['fit_time_s']:.0f} s)")
+        for k in names:
+            print(f"  {k:22s} {before[k]:10.3g} {ck.params_to_dict(params)[k]:10.3g}")
+        resources.release()
+        print(f"  after the noise fit: {resources.status()}", flush=True)
 
     noise = {}
     settings = ck.predictor_settings(cfg, info)   # observability and temperature of this fit
@@ -171,9 +230,11 @@ def main(cfg: DictConfig):
         figures.append(ioc_plots.plot_parameters(ck.params_to_dict(base), ck.params_to_dict(params), info,
                                                  HumanKinematicReaching.get_params_bounds(),
                                                  fig_dir / "ioc_parameters.png"))
+        print("  diagnostics: open-loop error of the training windows with the initial and the fitted weights",
+              flush=True)
         with jax.default_device(fit_device):
-            err_init = ck.segment_errors(trials, base, cfg.ioc, cfg.data)
-            err_fit = ck.segment_errors(trials, params, cfg.ioc, cfg.data)
+            err_init, err_fit = ck.segment_errors_many(trials, [base, params], cfg.ioc, cfg.data,
+                                                       labels=["initial", "fitted"])
         (root / "segment_errors.json").write_text(json.dumps(
             {"init": {k: v.tolist() for k, v in err_init.items()}, "fit": {k: v.tolist() for k, v in err_fit.items()}}))
         tracker.summary({"train_rms_cm/initial": float(err_init["rms_cm"].mean()),
@@ -183,6 +244,8 @@ def main(cfg: DictConfig):
         figures.append(ioc_plots.plot_fit_quality(err_init, err_fit, fig_dir / "ioc_fit_quality.png"))
         with jax.default_device(cpu):
             for tr in [t for t in trials if t.instruction_id in (1, 3)][:2]:
+                print(f"  diagnostics: example predictions of {tr.subject} instruction {tr.instruction_id} "
+                      f"(initial and fitted weights, CPU; the first one compiles the predictor)", flush=True)
                 figures.append(example_figure(tr, base, params, [float(x) for x in cfg.data.obs_ratios], H, max_iter,
                                               fig_dir / f"example_{tr.subject}_inst{tr.instruction_id}.png", tol,
                                               settings))

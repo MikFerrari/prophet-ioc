@@ -106,19 +106,28 @@ class Engine:
                                     evidence_lag=f["evidence_lag"], temperature=f["temperature"],
                                     obs_noise=f["obs_noise"])
         self.times = np.asarray(config["times"], dtype=float)
+        # warm start: each solve starts from the plan of the previous tick (hp.shift_plan) and runs at most
+        # "warm_max_iter" iterations (default 2; the first tick and the ticks after a reset run "max_iter" from zero).
+        # Early stopping (tol) does not save time here: the batch of hypotheses iterates until all have converged.
+        # On a replayed CARI reach, warm 2 iterations matched cold 3 (wrist 0.15 cm mean difference), 18 % faster.
+        self.warm_start = bool(config.get("warm_start", True))
+        self.warm_max_iter = int(config.get("warm_max_iter", 2))
+        self.plans = {}
 
     def warmup(self) -> float:
         t0 = time.perf_counter()
+        self.plans = {}
         q = np.zeros(28, dtype=np.float32)
         q[2], q[6] = 1.2, 1.0
         n = int(self.c["warmup_samples"])
         hist = np.repeat(q[None], n, axis=0)
         hist[:, 0] += np.linspace(0.0, 0.01, n)
         body = np.array([0.35, 0.45, 0.25, 0.3, 0.27, 0.4, 0.4, 0.2], dtype=np.float32)
-        for _ in range(2):
+        for k in range(3):   # compiles the cold solve and (k >= 1, no reset) the warm-started one
             self.predict({"t": 0.0, "hist": hist, "dt": self.c["warmup_dt"], "body": body, "head": None,
-                          "gaze": None, "goals": None, "reset": True})
+                          "gaze": None, "goals": None, "reset": k == 0})
         self.filter.reset()
+        self.plans = {}
         return time.perf_counter() - t0
 
     def predict(self, req: Dict) -> Dict:
@@ -131,12 +140,17 @@ class Engine:
             self.filter.hypotheses = self.hypotheses
         if req.get("reset"):
             self.filter.reset()
+            self.plans = {}
         preds, hs = hp.predict_hypotheses(np.asarray(req["hist"], dtype=np.float32), float(req["dt"]),
                                           np.asarray(req["body"], dtype=np.float32), self.hypotheses, self.params,
-                                          int(c["H"]), int(c["max_iter"]), horizon=float(c["horizon"]),
+                                          int(c["H"]), self.warm_max_iter if (self.warm_start and self.plans)
+                                          else int(c["max_iter"]), horizon=float(c["horizon"]),
                                           nominal_duration=float(c["nominal_duration"]),
                                           stop_time=float(c["stop_time"]), tol=c.get("tol"), settings=self.settings,
-                                          grasp_offset=float(c.get("grasp_offset", 0.0)))
+                                          grasp_offset=float(c.get("grasp_offset", 0.0)),
+                                          warm_start=self.plans if self.warm_start else None, t_now=float(req["t"]))
+        if self.warm_start:
+            self.plans = {(p.hypothesis.name, p.hypothesis.hand): p.plan for p in preds}
         head = None if req.get("head") is None else np.asarray(req["head"], dtype=float)
         gaze = None if req.get("gaze") is None else np.asarray(req["gaze"], dtype=float)
         log_prior = hp.goal_cue_logprior(self.hypotheses, hs, head, gaze, float(c["kappa_heading"]),

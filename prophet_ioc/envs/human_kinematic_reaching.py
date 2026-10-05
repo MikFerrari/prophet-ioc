@@ -73,6 +73,9 @@ class HumanKinematicParams(NamedTuple):
     # mismatch in the IOC likelihood (prophet_ioc.infer.multi_env). Not part of the dynamics, so the controller does not
     # plan against it, unlike motor_noise.
     residual_noise: float = 0.0
+    # Prediction only: scale of the handover Kalman covariance P0 that the predictive covariance starts from
+    # (prophet_ioc.human_prediction); fitted with residual_noise by the predictive stage 2 of train.py (ioc.noise_fit).
+    handover_cov_scale: float = 1.0
     # --- fixed, hand-tuned (config/model/human_kinematic.yaml, never learned) ---
     damping: float = 0.0               # b of qdd = u - b qd (1/s), exact ZOH discretization (prophet_ioc.envs.zoh)
     velocity_floor: float = 1e-6       # lower bound of the running joint-velocity weight (keeps Q_xx regular)
@@ -96,13 +99,13 @@ class HumanKinematicParams(NamedTuple):
             velocity_cost=1e-6, running_vel_cost=1e-7, base_disp_cost=1e-3, running_target_cost=1e-5,
             w_act_pelvis=2e-7, w_act_trunk=3e-8, w_act_spine=3e-8, w_act_reach_arm=1e-8, w_act_passive_arm=3e-8,
             w_act_head=2e-8, w_act_legs=8e-8, motor_noise=1e-2, motor_noise_add=1e-3, obs_noise=1e-3,
-            residual_noise=1e-3,
+            residual_noise=1e-3, handover_cov_scale=1e-2,
         )
         hi = HumanKinematicParams(
             velocity_cost=1e-2, running_vel_cost=1e-2, base_disp_cost=1.0, running_target_cost=10.0,
             w_act_pelvis=2e-3, w_act_trunk=3e-4, w_act_spine=3e-4, w_act_reach_arm=1e-4, w_act_passive_arm=3e-4,
             w_act_head=2e-4, w_act_legs=8e-4, motor_noise=1.0, motor_noise_add=10.0, obs_noise=10.0,
-            residual_noise=10.0,
+            residual_noise=10.0, handover_cov_scale=1e2,
         )
         return lo, hi
 
@@ -323,9 +326,15 @@ class HumanKinematicReaching(Env):
         # Initial state: [q, dq] in R^(2 * n_dof)
         self.x0 = jnp.concatenate([self.q0, jnp.zeros(self.n_dof, dtype=jnp.float32)])
 
-        # Target definitions
-        rw0 = self.wrist_right(self.x0)
-        lw0 = self.wrist_left(self.x0)
+        # Target definitions. The default targets need the wrists at x0: computed only when a target is missing, with
+        # a compiled forward kinematics (op by op it took ~40 ms, once per prediction, even with given targets)
+        need_right = target is None
+        need_left = target_left is None and self.reaching_hand != "left"
+        if need_right or need_left:
+            zero3 = jnp.zeros(3, dtype=jnp.float32)
+            self.target = self.target_vel = self.target_left = self.target_vel_left = zero3   # complete the pytree
+            self._init_shapes()
+            rw0, lw0 = _wrists_at(self, self.x0)
 
         # Right target (self.target):
         if target is not None:
@@ -695,6 +704,87 @@ class HumanKinematicReaching(Env):
         return term_r + term_l
 
 
+    # Exact quadratization of the cost from its structure (spec.make_lqr_approx uses it instead of jacfwd(grad)):
+    # False falls back to automatic differentiation (reference for tests).
+    fast_quadratization = True
+    # The motor noise of _dynamics is state-independent with covariance motor_noise^2 u_j^2 M(dt) on (q_j, qd_j) (+
+    # additive): ilqr_unrolled.backward uses the closed-form noise terms of glqr.backward_joint_signal_noise.
+    # False: the generic backward pass on the noise Jacobians (reference for tests).
+    joint_signal_noise = True
+
+    def quadratize_cost(self, X: jnp.ndarray, U: jnp.ndarray, params: HumanKinematicParams):
+        """(Q, q, P, R, r) of the running cost at (X[:-1], U) and (Qf, qf) of the final cost at X[-1]: the values (and
+        the derivatives, for the offline fit) of make_lqr_approx's jacfwd(grad) of _cost / _final_cost, computed from
+        the structure of the cost instead of differentiating the gradient once per state dimension:
+            effort, pelvis displacement, joint velocity   constant diagonal Hessians
+            joint limits                                   the joints only (no kinematics): exact autodiff Hessian
+            wrist targets (running, final position, final velocity)
+                                                           Gauss-Newton as gauss_newton_sq: gradient 2 J0^T r_lin and
+                                                           Hessian 2 J0^T J0 with the residual Jacobian J0 at
+                                                           stop_gradient(x) (3 x 19 for the positions: one forward-mode
+                                                           Jacobian of the forward kinematics for both wrists)
+        About an order of magnitude cheaper per step (the forward kinematics is differentiated 19 times instead of
+        ~96 times); identical up to floating-point rounding (tests/test_human_kinematic_reaching.py)."""
+        n = self.n_dof
+        sg = jax.lax.stop_gradient
+        scale = (self.dt / self.dt_ref) if self.dt_scaled_cost else 1.0
+        w_u = self.action_weights(params)
+        w_qd = jnp.maximum(params.running_vel_cost, params.velocity_floor)
+        w_r = params.running_target_cost
+        alphas = (self.alpha_right, self.alpha_left)
+        targets = (self.target, self.target_left)
+        lim = lambda q: self.joint_limit_penalty(q, params)
+
+        def wrists(q):
+            kp = self.all_keypoints(q)
+            return jnp.stack([kp[KP_RIGHT_WRIST], kp[KP_LEFT_WRIST]])        # (2, 3)
+
+        def gn(r0, J, dx):
+            """Gradient and Hessian of |r|^2 for r = stop_gradient(r0) + J dx (gauss_newton_sq)."""
+            r = sg(r0) + J @ dx
+            return 2.0 * J.T @ r, 2.0 * J.T @ J
+
+        def running(x, u):
+            q, qd = x[:n], x[n:]
+            q0s = sg(q)
+            w0 = wrists(q0s)
+            J0 = jax.jacfwd(wrists)(q0s)                                       # (2, 3, n)
+            gq = params.w_lim * jax.grad(lim)(q)
+            Hq = params.w_lim * jax.hessian(lim)(q)
+            gq = gq.at[0:3].add(params.base_disp_cost * (q[0:3] - self.q0[0:3]))
+            Hq = Hq.at[0:3, 0:3].add(params.base_disp_cost * jnp.eye(3, dtype=Hq.dtype))
+            for k in range(2):
+                g_k, H_k = gn(w0[k] - targets[k], J0[k], q - q0s)
+                gq = gq + 0.5 * w_r * alphas[k] * g_k
+                Hq = Hq + 0.5 * w_r * alphas[k] * H_k
+            qx = scale * jnp.concatenate([gq, w_qd * qd])
+            Qx = scale * jnp.block([[Hq, jnp.zeros((n, n), Hq.dtype)],
+                                    [jnp.zeros((n, n), Hq.dtype), w_qd * jnp.eye(n, dtype=Hq.dtype)]])
+            r = scale * w_u * u
+            R = scale * jnp.diag(w_u)
+            P = jnp.zeros((u.shape[0], x.shape[0]), dtype=Qx.dtype)
+            return Qx, qx, P, R, r
+
+        def final(x):
+            x0 = sg(x)
+            vel = lambda s: jax.jvp(wrists, (s[:n],), (s[n:],))[1]             # (2, 3) wrist velocities
+            w0, v0 = wrists(x0[:n]), vel(x0)
+            Jp = jax.jacfwd(lambda s: wrists(s[:n]))(x0)                       # (2, 3, 2n)
+            Jv = jax.jacfwd(vel)(x0)                                           # (2, 3, 2n)
+            vt = (self.target_vel, self.target_vel_left)
+            gx = jnp.zeros(2 * n, dtype=x.dtype)
+            Hx = jnp.zeros((2 * n, 2 * n), dtype=x.dtype)
+            for k in range(2):
+                g_p, H_p = gn(w0[k] - targets[k], Jp[k], x - x0)
+                g_v, H_v = gn(v0[k] - vt[k], Jv[k], x - x0)
+                gx = gx + alphas[k] * (g_p + params.velocity_cost * g_v)
+                Hx = Hx + alphas[k] * (H_p + params.velocity_cost * H_v)
+            return Hx, gx
+
+        Q, q, P, R, r = jax.vmap(running)(X[:-1], U)
+        Qf, qf = final(X[-1])
+        return Q, q, P, R, r, Qf, qf
+
     def _reset(
         self,
         noise: Optional[jnp.ndarray],
@@ -710,6 +800,12 @@ class HumanKinematicReaching(Env):
     @staticmethod
     def get_params_bounds() -> Tuple[HumanKinematicParams, HumanKinematicParams]:
         return HumanKinematicParams.get_params_bounds()
+
+
+@jax.jit
+def _wrists_at(env: "HumanKinematicReaching", x: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Right and left wrist positions at state x (compiled once per static configuration of the environment)."""
+    return env.wrist_right(x), env.wrist_left(x)
 
 
 def stack_envs(envs: List[HumanKinematicReaching]) -> HumanKinematicReaching:

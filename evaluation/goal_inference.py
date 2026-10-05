@@ -153,13 +153,19 @@ def replay_session(S, ocfg, params, H, max_iter, pred_noise, nominal_duration, t
            "pmean": np.zeros((T, K, len(taus), 2, 3)), "pcov": np.zeros((T, K, len(taus), 2, 3, 3)),
            "latency": np.zeros(T), "taus": taus,
            "movements": [(m.segment, m.onset, m.offset, m.goals, m.hands) for m in S.movements]}
+    warm, plans = bool(ocfg.get("warm_start", True)), {}
+    warm_iter = int(ocfg.get("warm_max_iter", 2))
     for k, (t, f) in enumerate(zip(tqdm(t_ticks, desc=subject, leave=False), out["frame"])):
         stamps = S.time[f - n_win: f + 1]
         hist = hp.resample_history(stamps, q_src[f - n_win: f + 1], stamps[-1], ocfg.observation_time, ocfg.samples)
         t0 = time.perf_counter()
-        preds, hs = hp.predict_hypotheses(hist, dt_s, S.body_params, hyps, params, H, max_iter,
+        preds, hs = hp.predict_hypotheses(hist, dt_s, S.body_params, hyps, params, H,
+                                          warm_iter if (warm and plans) else max_iter,
                                           horizon=ocfg.horizon, nominal_duration=nominal_duration, tol=tol,
-                                          settings=settings, grasp_offset=float(ocfg.get("grasp_offset", 0.0)))
+                                          settings=settings, grasp_offset=float(ocfg.get("grasp_offset", 0.0)),
+                                          warm_start=plans if warm else None, t_now=float(t))
+        if warm:   # as the ROS 2 node: the next tick starts from these plans
+            plans = {(p.hypothesis.name, p.hypothesis.hand): p.plan for p in preds}
         out["latency"][k] = time.perf_counter() - t0
         out["heading"][k] = hp.goal_cue_logprior(hyps, hs, None, None, 1.0, 0.0, V_REF)
         if S.gaze is not None:

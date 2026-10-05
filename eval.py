@@ -162,16 +162,19 @@ def evaluate_trial(trial, obs_ratio, params, pred_noise, cfg, initial=None, lear
 
     reaching_mode = str(cfg.model.get("reaching_mode", "dual"))
     inferred_hand = ck.infer_reaching_hand(frames, trial.onset_idx, f_obs, allow_both=(reaching_mode == "dual"))
+    # eval.hand: known = the dataset's reaching hand, the information of every baseline (default); inferred = the
+    # hand detected from the observed motion (ck.infer_reaching_hand), as the online predictor without goal inference
+    model_hand = hand if str(cfg.eval.get("hand", "known")) == "known" else inferred_hand
     kin, cov, lat_kin, t_pred, dt_sim = predict_kinematic(trial, frames, f_obs, params, pred_noise, H,
                                                           int(cfg.model.max_iter),
-                                                          inferred_hand, tol,
+                                                          model_hand, tol,
                                                           settings, reaching_mode=reaching_mode)
     cart, lat_cart = predict_cartesian(obs, hand, frames.target, dt_sim, t_pred, t_rem, H, dt)
     methods, latency, covs = {"kin": kin, "cart": cart}, {"kin": lat_kin, "cart": lat_cart}, {"kin": cov}
     if initial is not None:   # (params, pred_noise, settings) of the initial weights
         methods["kin_init"], covs["kin_init"], latency["kin_init"], _, _ = predict_kinematic(
             trial, frames, f_obs, initial[0], initial[1], H, int(cfg.model.max_iter),
-            inferred_hand, tol, initial[2], reaching_mode=reaching_mode)
+            model_hand, tol, initial[2], reaching_mode=reaching_mode)
 
     goal = lambda j: frames.target if j == w else None
     for name in ("minjerk", "gcv"):
@@ -202,7 +205,7 @@ def evaluate_trial(trial, obs_ratio, params, pred_noise, cfg, initial=None, lear
         rows.append({"subject": trial.subject, "instruction": trial.instruction_id, "method": m, **mets[m]})
     record = {"subject": trial.subject, "velocity": trial.velocity, "instruction": trial.instruction_id,
               "task": trial.task_description, "obs_ratio": obs_ratio, "pred_dur": t_rem, "H": H, "hand": hand,
-              "dt": dt, "target": frames.target, "obs": obs, "gt": gt, "methods": methods, "metrics": mets,
+              "dt": dt, "target": frames.target, "model_hand": model_hand, "inferred_hand": inferred_hand, "obs": obs, "gt": gt, "methods": methods, "metrics": mets,
               "cov": cov, "covs": covs, "nom_bone_lens": nom_bones,
               "wrist_error_curve": {m: np.linalg.norm(p[w] - gt[w], axis=1) * 100.0 for m, p in methods.items()}}
     return rows, record
@@ -320,7 +323,10 @@ def main(cfg: DictConfig):
                 for m, c in record["wrist_error_curve"].items():
                     curves.setdefault(m, []).append(c)
                 kin = record["metrics"]["kin"]
-                print(f"  [{k:2d}/{len(trials)}] {trial.subject:6s} inst{trial.instruction_id} | kin MPJPE "
+                print(f"  [{k:2d}/{len(trials)}] {trial.subject:6s} inst{trial.instruction_id} {trial.velocity:6s} | hand "
+                      f"{record['model_hand']}" + (f" (detected {record['inferred_hand']})"
+                                                   if record['inferred_hand'] != record['model_hand'] else "") +
+                      f" | kin MPJPE "
                       f"{kin['mpjpe_cm']:5.2f} cm, wrist FDE {kin['wrist_fde_cm']:5.2f} cm, wrist coverage "
                       f"{kin['coverage_wrist_pct']:3.0f}% | best baseline MPJPE "
                       f"{min(record['metrics'][m]['mpjpe_cm'] for m in record['metrics'] if m != 'kin'):5.2f} cm",

@@ -51,6 +51,8 @@ human_motion_predictor:
     frame_id: ""                                        # "" = frame of the input
     warmup: true                                        # compile at start-up (otherwise the first prediction is slow)
     world_frame: ""                                     # transform the ZED keypoints to this frame (TF), "" = keep theirs
+    warm_start: true                                    # solves start from the previous tick's plans (fewer iterations)
+    warm_max_iter: 2                                    # solver iterations of the warm-started ticks (cold: max_iter)
     head_keypoint: nose                                 # model "head", as data.head_keypoint of the weights: nose |
                                                         # centroid (of nose and ears) | ears (midpoint)
     joint_limits: cari                                  # IK limits: cari (+-pi, as the CARI data) | model (anatomical)

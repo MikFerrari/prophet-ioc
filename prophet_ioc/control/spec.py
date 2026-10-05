@@ -31,8 +31,17 @@ def make_lqr_approx(p: Env, params: Any) -> Callable:
         A, B = jacobian(p._dynamics, argnums=(0, 1))(x, u, jnp.zeros(p.state_noise_shape), params)
         return Q, q, P, R, r, A, B
 
+    @vmap
+    def linearize_dynamics(x, u):
+        return jacobian(p._dynamics, argnums=(0, 1))(x, u, jnp.zeros(p.state_noise_shape), params)
+
     def approx(X, U):
         assert X.shape[0] == (U.shape[0] + 1)
+        if getattr(p, "fast_quadratization", False) and hasattr(p, "quadratize_cost"):
+            # the environment's exact quadratization of its cost (same values as the autodiff below, much cheaper)
+            Q, q, P, R, r, Qf, qf = p.quadratize_cost(X, U, params)
+            A, B = linearize_dynamics(X[:-1], U)
+            return LQRSpec(Q=Q, q=q, Qf=Qf, qf=qf, P=P, R=R, r=r, A=A, B=B)
         Q, q, P, R, r, A, B = approx_timestep(X[:-1], U)
 
         # quadratic approximation of the final time step costs

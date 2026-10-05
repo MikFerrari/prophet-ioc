@@ -104,7 +104,15 @@ def test_psd_projection_derivative():
     with jax.enable_x64(True):
         k = jax.random.split(jax.random.PRNGKey(0), 3)
         A = jax.random.normal(k[0], (6, 6))
-        jax.test_util.check_grads(psd_projection, (A + A.T,), order=1, modes=["fwd", "rev"])
+        # forward and reverse derivatives vs central finite differences (jax.test_util.check_grads, removed in JAX 0.11)
+        S, D = A + A.T, jax.random.normal(jax.random.PRNGKey(1), (6, 6))
+        D = D + D.T
+        h = 1e-6
+        fd = (psd_projection(S + h * D) - psd_projection(S - h * D)) / (2 * h)
+        np.testing.assert_allclose(jax.jvp(psd_projection, (S,), (D,))[1], fd, atol=1e-6)
+        C = jax.random.normal(jax.random.PRNGKey(2), (6, 6))
+        _, vjp = jax.vjp(psd_projection, S)
+        np.testing.assert_allclose(jnp.sum(vjp(C)[0] * D), jnp.sum(C * fd), rtol=1e-6, atol=1e-6)
         B = jax.random.normal(k[1], (6, 3))
         P = B @ B.T + jnp.eye(6)                                   # eigenvalue 1 repeated 3 times
         dS = jax.random.normal(k[2], (6, 6))

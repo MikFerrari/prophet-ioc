@@ -35,6 +35,8 @@ motor_noise: 0.1        # signal-dependent motor noise intensity (std of qd per 
 obs_noise: 0.1          # observation noise of the partially observed model (ioc.observability: partial; fitted there)
 residual_noise: 1.0     # likelihood only (not seen by the controller): white-noise acceleration intensity absorbing
                         # model mismatch, fitted with the weights (ioc.objective: likelihood); initial value
+handover_cov_scale: 1.0 # prediction only: scale of the handover Kalman covariance the predictive covariance starts
+                        # from (fitted with residual_noise by the predictive stage 2 of train.py, ioc.noise_fit)
 
 # --- learnable cost weights (initial values; HumanKinematicParams.LEARNABLE) ---
 velocity_cost: 1.0e-4   # terminal wrist velocity
@@ -50,6 +52,8 @@ w_act_passive_arm: 3.0e-6  # other arm
 w_act_head: 2.0e-6      # head rot x/y
 
 # --- optional terms (switches) ---
+learn_motor_noise: true # open_loop fits: also learn motor_noise (it shapes the plan: the gILQR backward pass accounts
+                        # for the signal-dependent noise); never with the one-step likelihood (it went to its bound)
 pelvis_displacement_cost: true  # false: no pelvis displacement term (e.g. walking tasks), base_disp_cost not learned
 running_target: true    # learn running_target_cost (false: keep the value above, not learned)
 joint_limit_cost: true  # joint-limit penalty 0.5 w_lim sum_j [max(0, q - q_max)^2 + max(0, q_min - q)^2] (anatomical
