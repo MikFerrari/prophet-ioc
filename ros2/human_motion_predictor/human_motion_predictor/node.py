@@ -115,7 +115,8 @@ class HumanMotionPredictor(Node):
         self.frame_id = p("frame_id", "").value              # "" = frame of the input messages
         self.warmup = p("warmup", True).value
         self.world_frame = p("world_frame", "").value       # "" = keep the frame of the ZED message
-        head_keypoint = p("head_keypoint", "nose").value    # nose (as CARI) | ears (midpoint, as human_kinematics_ros)
+        head_keypoint = p("head_keypoint", "nose").value    # as data.head_keypoint of the weights: nose | centroid (of nose
+                                                            # and ears) | ears (midpoint, as human_kinematics_ros)
         joint_limits = p("joint_limits", "cari").value      # cari (+-pi, IK of the CARI dataset) | model (anatomical)
 
         # JAX and the model are imported here (slow): after the parameters, so that errors in them show up first

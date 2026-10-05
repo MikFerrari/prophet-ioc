@@ -23,19 +23,29 @@ and the tools of `human_kinematic_model`):
 ```bash
 python3 -m venv --upgrade-deps --prompt prophet_venv .venv
 source .venv/bin/activate
-pip install -e ".[cuda,dev]"     # CPU only: pip install -e ".[dev]"
+python -m pip install -e ".[cuda,dev]"     # CPU only: python -m pip install -e ".[dev]"
+python -m pip show prophet-ioc hydra-core jax | grep -E "^(Name|Version)"   # check: three packages listed
 ```
+
+Use `python -m pip`, not a bare `pip`: an alias, `~/.local/bin/pip` or conda can make `pip` belong to another
+environment even with the venv active, and the packages then land there (`ModuleNotFoundError: No module named
+'hydra'` at the first run). `cuda` installs `jax[cuda13]`, which needs NVIDIA driver >= 580 (`nvidia-smi`); with an
+older driver (>= 525) install `".[dev]"` and then `python -m pip install -U "jax[cuda12]"`.
 
 Do not rename or move the venv after creating it: its scripts (`pip`, `pytest`, `activate`) hard-code its path.
 Recreate it instead.
 
 ### 1.2 Human Kinematic Model Dependency
-The JAX-differentiable 28-DOF kinematic chain (`human_kinematic_model_jax`) is a script of the sibling repository
-`human_kinematic_model`, not a pip package: put its `scripts/` folder on the venv's path with a `.pth` file:
+The JAX-differentiable 28-DOF kinematic chain (`human_kinematic_model_jax`) is the pip package `human_model` of the
+repository [human_kinematic_model](https://github.com/JRL-CARI-CNR-UNIBS/human_kinematic_model) (branch `jax`), a
+dependency in `pyproject.toml`: the installation of 1.1 downloads and installs it (it compiles a small C++ binding,
+so a C++ compiler is needed; see that repository's README, Installation A).
+
+To develop the model alongside, with the clone in `../human_kinematic_model`, replace it by an editable install of the
+clone (its python modules are then imported from the clone's `scripts/`, changes are live):
 
 ```bash
-realpath ../human_kinematic_model/scripts \
-    > "$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')/human_kinematic_model.pth"
+python -m pip install -e ../human_kinematic_model
 ```
 
 ### 1.3 Hardware Acceleration

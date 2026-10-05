@@ -590,6 +590,7 @@ def main(cfg: DictConfig):
     if ocfg.goal_mode not in ("inferred", "known") or ocfg.uncertainty not in ("map", "mixture"):
         raise ValueError("online.goal_mode must be inferred | known, online.uncertainty map | mixture")
     dev = ck.setup_jax(ocfg.device)
+    cs.cari.HEAD_KEYPOINT = str(cfg.data.get("head_keypoint") or cs.cari.HEAD_KEYPOINT)   # dataset of the sessions
     params, pred_noise, source, settings = model_parameters(cfg)
     noise_txt = "model covariance" if pred_noise is None else f"random-walk noise {pred_noise:.3g}"
     H, max_iter, tol = int(cfg.model.horizon), int(cfg.model.max_iter), hp.solver_tolerance(cfg.model)

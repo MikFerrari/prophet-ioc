@@ -132,8 +132,9 @@ IK of the human kinematic model, `human_kinematic_model_jax.ik`
 ([`../ros2/human_motion_predictor/human_motion_predictor/ik.py`](../ros2/human_motion_predictor/human_motion_predictor/ik.py),
 `ZedIK`):
 - the 13 model keypoints are taken from the ZED keypoints of the message's body format (BODY_18 / 34 / 38); `head`
-  is the nose (`head_keypoint: nose`, as in the CARI v2 data the predictor was tuned on) or the midpoint of the ears
-  (`ears`, as in `human_kinematics_ros`);
+  is the nose (`head_keypoint: nose`, as in the original CARI v2 data), the centroid of the nose and the ears
+  (`centroid`, as in the data of `data.head_keypoint: centroid`) or the midpoint of the ears (`ears`, as in
+  `human_kinematics_ros`); it must match the `data.head_keypoint` of the fitted weights;
 - joint limits `cari` (default: +-pi, +-pi/2 for the shoulder / hip y rotations, as the IK of the CARI dataset) or
   `model` (anatomical defaults of the model, which reject up to ~70 % of the frames of a CARI reach where, with ZED
   noise, a nearly straight elbow / knee or the head goes slightly past them);

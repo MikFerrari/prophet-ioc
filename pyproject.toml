@@ -31,6 +31,9 @@ dependencies = [
     "plotly >= 5.0",
     "kaleido >= 0.2",
     "pillow >= 9.0",
+    # 28-DOF human kinematic model (import human_kinematic_model_jax), a pip package of its own repository; to develop
+    # it alongside, install the local clone in editable mode afterwards: python -m pip install -e ../human_kinematic_model
+    "human_model @ git+https://github.com/JRL-CARI-CNR-UNIBS/human_kinematic_model.git@jax",
 ]
 
 [project.optional-dependencies]
@@ -41,9 +44,8 @@ dev = ["pytest >= 7", "pybind11 >= 2.10", "sympy"]
 # experiment tracking of train.py / eval.py (config wandb): pip install -e ".[tracking]"
 tracking = ["wandb"]
 
-# human_kinematic_model_jax (../human_kinematic_model/scripts) is not a pip package: it is put on sys.path by
-# human_kinematic_model.pth in the venv's site-packages (see README). kimodo/torch (evaluation/kimodo_reaches.py
-# generate) run in kimodo's own venv, the ROS 2 node (ros2/) in the ROS environment.
+# kimodo/torch (evaluation/kimodo_reaches.py generate) run in kimodo's own venv, the ROS 2 node (ros2/) in the ROS
+# environment.
 
 [tool.setuptools.packages.find]
 include = ["prophet_ioc*", "plot_utils*"]

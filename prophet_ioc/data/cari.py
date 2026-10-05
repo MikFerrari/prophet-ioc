@@ -22,6 +22,16 @@ SEARCH_PATHS = [
     Path("/home/dirichlet/projects/human_motion_prediction/prob_ioc/cache/pick_place_joints.pkl"),
 ]
 
+# Model "head" keypoint of the IK angles and head distance of the dataset (data.head_keypoint):
+#   "nose"      ZED BODY_18 nose, as in the original CARI v2 pipeline (SEARCH_PATHS); in front of the face, lost when
+#               the subject looks down
+#   "centroid"  centroid of the nose and the two ears (datasets/build_cari_v2_head_centroid.py), the same dataset with
+#               only the head joint refitted
+HEAD_KEYPOINT_CACHES = {
+    "centroid": Path(__file__).resolve().parents[2] / "cache" / "pick_place_joints_head_centroid.pkl",
+}
+HEAD_KEYPOINT = "nose"   # default of CariDataset(); set from data.head_keypoint by cari_kinematic.load_trials
+
 INSTRUCTION_METADATA = {
     1: {"name": "Reach Object 1 (Right Hand)", "hand": "right", "target_obj": "Object 1"},
     2: {"name": "Return to Home", "hand": "both", "target_obj": "Home"},
@@ -89,22 +99,30 @@ class CariTrial:
 class CariDataset:
     """Manages access to the CARI v2 Pick-and-Place dataset."""
 
-    _cached_df: Optional[pd.DataFrame] = None
+    _cached_dfs: Dict[Path, pd.DataFrame] = {}
 
-    def __init__(self, pkl_path: Optional[str | Path] = None):
-        if CariDataset._cached_df is None:
-            path = self._resolve_path(pkl_path)
+    def __init__(self, pkl_path: Optional[str | Path] = None, head_keypoint: Optional[str] = None):
+        """pkl_path: cached dataset (default: the one of head_keypoint, HEAD_KEYPOINT if None)."""
+        path = self._resolve_path(pkl_path, head_keypoint or HEAD_KEYPOINT)
+        if path not in CariDataset._cached_dfs:
             if not path.exists():
                 raise FileNotFoundError(
-                    f"CARI v2 cached dataset not found at {path}. Checked locations: {SEARCH_PATHS}"
+                    f"CARI v2 cached dataset not found at {path}. Checked locations: {SEARCH_PATHS}, "
+                    f"{HEAD_KEYPOINT_CACHES}"
                 )
-            CariDataset._cached_df = pd.read_pickle(path)
-        self.df = CariDataset._cached_df
+            CariDataset._cached_dfs[path] = pd.read_pickle(path)
+        self.path = path
+        self.df = CariDataset._cached_dfs[path]
 
     @staticmethod
-    def _resolve_path(pkl_path: Optional[str | Path]) -> Path:
+    def _resolve_path(pkl_path: Optional[str | Path], head_keypoint: str = "nose") -> Path:
         if pkl_path is not None and Path(pkl_path).exists():
             return Path(pkl_path)
+        if head_keypoint != "nose":
+            if head_keypoint not in HEAD_KEYPOINT_CACHES:
+                raise ValueError(f"head_keypoint must be nose or one of {list(HEAD_KEYPOINT_CACHES)}, "
+                                 f"got {head_keypoint!r}")
+            return HEAD_KEYPOINT_CACHES[head_keypoint]
         for p in SEARCH_PATHS:
             if p.exists():
                 return p

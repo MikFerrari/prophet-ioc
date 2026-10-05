@@ -32,6 +32,7 @@ from tqdm import tqdm
 
 import human_kinematic_model_jax as hkm
 from prophet_ioc.data import CariDataset, CariTrial
+from prophet_ioc.data import cari
 from prophet_ioc.data.cari import RTS_ACCEL_NOISE, RTS_OBS_NOISE, rts_upper_body_state, sg_upper_body_state
 from prophet_ioc.envs.human_kinematic_reaching import (HumanKinematicParams, HumanKinematicReaching, learnable_params,
                                                        params_from_config, stack_envs)
@@ -88,7 +89,9 @@ def split_subjects(data_cfg) -> Tuple[List[str], List[str]]:
 
 def load_trials(data_cfg, subjects: Optional[Sequence[str]] = None) -> List[CariTrial]:
     """The trials selected by the data config (subjects x instructions, one or multiple velocities), for `subjects`
-    (default: all the subjects of the config)."""
+    (default: all the subjects of the config). data.head_keypoint selects the dataset (prophet_ioc.data.cari
+    HEAD_KEYPOINT_CACHES) and becomes the default of every CariDataset of the process (cari_sessions)."""
+    cari.HEAD_KEYPOINT = str(getattr(data_cfg, "head_keypoint", None) or cari.HEAD_KEYPOINT)
     ds = CariDataset()
     trials = []
     raw = getattr(data_cfg, "velocities", getattr(data_cfg, "velocity", "FAST"))

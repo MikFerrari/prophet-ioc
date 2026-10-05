@@ -22,7 +22,7 @@ import pandas as pd
 from scipy.signal import medfilt
 
 import human_kinematic_model_jax as hkm
-from prophet_ioc.data import CariDataset
+from prophet_ioc.data import CariDataset, cari  # cari.HEAD_KEYPOINT: dataset of CariDataset()
 from prophet_ioc.data.cari import BODY_PARAM_NAMES
 from prophet_ioc.human_prediction import Hypothesis
 

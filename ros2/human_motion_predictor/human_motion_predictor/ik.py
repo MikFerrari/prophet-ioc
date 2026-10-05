@@ -4,9 +4,10 @@ model, with the model's own IK (human_kinematic_model_jax.ik).
 The 13 keypoints of the model (human_kinematic_model_jax.KEYPOINT_NAMES: head, left shoulder / elbow / wrist,
 left hip / knee / ankle, right shoulder / elbow / wrist, right hip / knee / ankle) are taken from the ZED keypoints
 of the message's body format (zed_msgs/Object.body_format: 0 BODY_18, 1 BODY_34, 2 BODY_38; keypoint order of the
-ZED SDK). "head" is the nose (as in the CARI v2 dataset the predictor was tuned on,
-human_motion_dataset/config/params.yaml) or the midpoint of the ears (as in human_kinematics_ros); the head distance
-parameter and the head angles depend on this choice.
+ZED SDK). "head" is the nose (as in the original CARI v2 dataset, human_motion_dataset/config/params.yaml), the
+centroid of the nose and the ears (as in datasets/cari_v2_head_centroid, data.head_keypoint: centroid) or the midpoint
+of the ears (as in human_kinematics_ros); the head distance parameter and the head angles depend on this choice, which
+must match the dataset of the fitted weights.
 
 The IK returns q (28): [0:3] chest position, [3:7] chest quaternion (x, y, z, w), [7] shoulder rot x, [8:10] hip rot
 z/x, [10:14] right arm, [14:18] left arm, [18:22] right leg, [22:26] left leg, [26:28] head rot x/y; and the 8 body
@@ -76,8 +77,8 @@ class ZedIK:
         import jax
         import human_kinematic_model_jax as hkm
 
-        if head not in ("nose", "ears"):
-            raise ValueError(f"head must be 'nose' or 'ears', got {head}")
+        if head not in ("nose", "ears", "centroid"):
+            raise ValueError(f"head must be 'nose', 'ears' or 'centroid', got {head}")
         self.hkm, self.head = hkm, head
         if joint_limits not in ("cari", "model"):
             raise ValueError(f"joint_limits must be 'cari' or 'model', got {joint_limits}")
@@ -98,7 +99,9 @@ class ZedIK:
         rows = []
         for name in self.hkm.KEYPOINT_NAMES:
             if name == "head":
-                rows.append(kpts[index["nose"]] if self.head == "nose" else kpts[list(index["ears"])].mean(axis=0))
+                nose, ears = kpts[index["nose"]], kpts[list(index["ears"])]
+                rows.append({"nose": nose, "ears": ears.mean(axis=0),
+                             "centroid": (nose + ears.sum(axis=0)) / 3.0}[self.head])
             else:
                 rows.append(kpts[index[name]])
         out = np.stack(rows)
