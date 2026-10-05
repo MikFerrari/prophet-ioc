@@ -39,10 +39,18 @@ ioc:                   # train.py: IOC fit on the complete reaches of the traini
   lr: 0.05              # Adam step (log10 units)
   patience: 20          # stop when the best loss improved by less than tol (relative) over patience iterations
   tol: 1.0e-3
-  batch_size: null      # segments per batch inside a restart (lower = less GPU memory); null = 16 (open_loop), 2 (likelihood)
+  batch_size: null      # windows per batch inside a restart (lower = less GPU memory); null = 16 (open_loop) or 2
+                        # (likelihood) windows on the GPU at once, divided by the restarts (at least 1)
   seed: 0
   device: gpu
   output_dir: null      # null = output/train_<timestamp>
+  resources:            # evaluation/resources.py: memory watchdog, priority and CPUs of the training process
+    max_ram_gb: null    # stop the run above this process RAM; null = max_ram_fraction of the physical RAM
+    max_ram_fraction: 0.8  # per-process cap; the system check below is the main protection (an open-loop fit on 237
+                        # windows with 4 restarts reached 18 GB)
+    min_available_gb: 3.0  # stop the run when the system's available RAM falls below this (before it swaps)
+    free_cpus: 2        # cores left to the rest of the system (XLA compilation uses the others)
+    nice: 10            # lower scheduling priority
 
 wandb:                  # experiment tracking (evaluation/tracking.py) of train.py and eval.py; runs in output/wandb/
   enabled: true         # false: no tracking

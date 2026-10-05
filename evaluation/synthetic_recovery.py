@@ -156,11 +156,11 @@ def main(cfg: DictConfig):
     log(f"output {root}, device {device}")
     (root / "config.yaml").write_text(OmegaConf.to_yaml(cfg, resolve=True))
     train_subjects, test_subjects = ck.split_subjects(cfg.data)
-    trials = ck.load_trials(cfg.data, train_subjects)
+    trials = ck.load_trials(cfg.data, train_subjects, role="training")
     if syn.n_trials:
         pick = np.random.default_rng(syn.seed).choice(len(trials), min(int(syn.n_trials), len(trials)), replace=False)
         trials = [trials[i] for i in sorted(pick)]
-    test_trials = ck.load_trials(cfg.data, test_subjects)
+    test_trials = ck.load_trials(cfg.data, test_subjects, role="test")
     log(f"data: {len(trials)} training reaches ({', '.join(train_subjects)}), {len(test_trials)} test reaches "
         f"({', '.join(test_subjects)})")
 

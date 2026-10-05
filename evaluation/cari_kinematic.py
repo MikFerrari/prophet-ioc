@@ -19,7 +19,10 @@ switched-off terms), with parallel restarts of projected Adam in log10 space; th
 """
 
 import json
+import logging
+import threading
 import time
+from datetime import datetime
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -33,6 +36,7 @@ from tqdm import tqdm
 import human_kinematic_model_jax as hkm
 from prophet_ioc.data import CariDataset, CariTrial
 from prophet_ioc.data import cari
+from prophet_ioc.data.cari import INSTRUCTION_METADATA
 from prophet_ioc.data.cari import RTS_ACCEL_NOISE, RTS_OBS_NOISE, rts_upper_body_state, sg_upper_body_state
 from prophet_ioc.envs.human_kinematic_reaching import (HumanKinematicParams, HumanKinematicReaching, learnable_params,
                                                        params_from_config, stack_envs)
@@ -87,22 +91,28 @@ def split_subjects(data_cfg) -> Tuple[List[str], List[str]]:
     return train, (test or train)
 
 
-def load_trials(data_cfg, subjects: Optional[Sequence[str]] = None) -> List[CariTrial]:
+def load_trials(data_cfg, subjects: Optional[Sequence[str]] = None, role: str = "") -> List[CariTrial]:
     """The trials selected by the data config (subjects x instructions, one or multiple velocities), for `subjects`
     (default: all the subjects of the config). data.head_keypoint selects the dataset (prophet_ioc.data.cari
-    HEAD_KEYPOINT_CACHES) and becomes the default of every CariDataset of the process (cari_sessions)."""
+    HEAD_KEYPOINT_CACHES) and becomes the default of every CariDataset of the process (cari_sessions).
+    Prints the selection and how the number of trials adds up (requested, skipped by reason, kept); role labels the
+    summary (e.g. "training", "test")."""
     cari.HEAD_KEYPOINT = str(getattr(data_cfg, "head_keypoint", None) or cari.HEAD_KEYPOINT)
     ds = CariDataset()
     trials = []
+    skipped = {}   # reason -> ["sub/instI/VEL", ...]
     raw = getattr(data_cfg, "velocities", getattr(data_cfg, "velocity", "FAST"))
     vels = [raw] if isinstance(raw, str) else list(raw)
+    subjects = list(subjects if subjects is not None else data_cfg.subjects)
+    instructions = [int(i) for i in data_cfg.instructions]
     for vel in vels:
-        for s in (subjects if subjects is not None else data_cfg.subjects):
-            for i in data_cfg.instructions:
+        for s in subjects:
+            for i in instructions:
                 try:
                     tr = ds.load_trial(subject=s, velocity=str(vel), instruction_id=int(i), v_thresh_ratio=0.12)
                 except ValueError as exc:
                     print(f"  skipping {s}/inst{i}/{vel}: {exc}")
+                    skipped.setdefault("not loadable", []).append(f"{s}/inst{i}/{vel}")
                     continue
                 # IK failures (e.g. sub_3/inst3 SLOW, MEDIUM: 20-30 % of the reach): NaN keypoints for the baselines,
                 # a gap bridged by the RTS smoother in the IOC windows, and the wrong reaching hand (NaN wrist
@@ -111,8 +121,20 @@ def load_trials(data_cfg, subjects: Optional[Sequence[str]] = None) -> List[Cari
                 if n_bad:
                     print(f"  skipping {s}/inst{i}/{vel}: {n_bad} of {tr.offset_idx - tr.onset_idx + 1} reach frames "
                           f"without joint angles (IK failure)")
+                    skipped.setdefault("NaN joint angles (IK failure)", []).append(f"{s}/inst{i}/{vel}")
                     continue
                 trials.append(tr)
+    n_req = len(subjects) * len(instructions) * len(vels)
+    n_skip = sum(len(v) for v in skipped.values())
+    names = lambda ids: ", ".join(f"{i} ({INSTRUCTION_METADATA[i]['name']})" if i in INSTRUCTION_METADATA else str(i)
+                                  for i in ids)
+    print(f"--- {role + ' ' if role else ''}data: head keypoint {cari.HEAD_KEYPOINT}\n"
+          f"    instructions: {names(instructions)}\n"
+          f"    velocities:   {', '.join(map(str, vels))}\n"
+          f"    subjects:     {', '.join(subjects)}\n"
+          f"    {len(subjects)} subjects x {len(instructions)} instructions x {len(vels)} velocities = {n_req} reaches"
+          + "".join(f"\n    - {len(v):3d} skipped, {reason}: {', '.join(v)}" for reason, v in skipped.items())
+          + f"\n    = {len(trials)} reaches kept" + (f" ({n_skip} skipped)" if n_skip else ""), flush=True)
     return trials
 
 
@@ -401,9 +423,15 @@ def fit_param_names(ioc_cfg, model_cfg) -> Tuple[str, ...]:
     return names
 
 
-# Trials per batch inside a restart (lax.map): the likelihood gradient carries the noise Jacobians of the gILQR
-# linearization and needs much more memory than the open-loop one (16 or 4 trials x 4 restarts ran out of 8 GB)
-DEFAULT_BATCH = {"open_loop": 16, "likelihood": 2}
+# Windows evaluated at once on the GPU = restarts (vmap) x batch (lax.map chunk inside a restart). Budgets that fit the
+# 8 GB GPU: the likelihood gradient carries the noise Jacobians of the gILQR linearization and needs much more memory
+# than the open-loop one (likelihood: 16 or 4 windows x 4 restarts ran out; open loop: 16 x 4 restarts ran out, 16 x 1
+# fits). With ioc.batch_size null the batch is budget / restarts (at least 1).
+WINDOWS_IN_FLIGHT = {"open_loop": 16, "likelihood": 2}
+
+
+def default_batch_size(objective: str, restarts: int) -> int:
+    return max(1, WINDOWS_IN_FLIGHT[objective] // max(1, int(restarts)))
 
 _UPPER_BODY_KP = jnp.array([hkm.KP_INDEX[n] for n in ("head", "left_shoulder", "left_elbow", "left_wrist",
                                                       "right_shoulder", "right_elbow", "right_wrist")])
@@ -490,7 +518,11 @@ def make_objective(groups, base_params: HumanKinematicParams, infer: Sequence[st
     maximize): "likelihood" (MultiTrialLikelihood with ioc.observability, ioc.linearization, ioc.temperature,
     ioc.likelihood_block, ioc.solve_iters, ioc.checkpoint) or "open_loop" (MultiTrialTrajectoryMatching)."""
     objective = ioc_cfg.objective
-    batch = ioc_cfg.get("batch_size") or DEFAULT_BATCH[objective]
+    restarts = int(ioc_cfg.get("restarts", 1))
+    batch = int(ioc_cfg.get("batch_size") or default_batch_size(objective, restarts))
+    print(f"  GPU batch: {restarts} restarts x {batch} windows = {restarts * batch} windows at once"
+          + (f" (above the {WINDOWS_IN_FLIGHT[objective]} known to fit 8 GB: lower ioc.restarts or ioc.batch_size if "
+             f"it runs out of GPU memory)" if restarts * batch > WINDOWS_IN_FLIGHT[objective] else ""), flush=True)
     iters = int(ioc_cfg.get("solve_iters", 8))
     checkpoint = bool(ioc_cfg.get("checkpoint", False))
     if objective == "open_loop":
@@ -507,6 +539,133 @@ def make_objective(groups, base_params: HumanKinematicParams, infer: Sequence[st
                                     temperature=float(ioc_cfg.get("temperature", 1e-6)), checkpoint=checkpoint)
     raise ValueError(f"objective must be 'likelihood' or 'open_loop', got {objective}")
 
+
+
+# =============================================================================
+# Compilation with progress (fit_params)
+# =============================================================================
+COMPILE_LOG = REPO_ROOT / "output" / "compile_times.jsonl"   # one record per compiled IOC objective
+
+
+class _CacheLog(logging.Handler):
+    """Collects the persistent-cache messages of JAX (hit, write, or why an entry was not written)."""
+
+    def __init__(self):
+        super().__init__(logging.DEBUG)
+        self.messages = []
+
+    def emit(self, record):
+        msg = record.getMessage()
+        if "persistent" in msg.lower() or "cache" in msg.lower():
+            self.messages.append(msg if len(msg) < 300 else msg[:300] + "...")
+
+
+def _compile_estimate(records: List[Dict], key: Dict, size_mb: Optional[float], field: str) -> Optional[float]:
+    """Median of `field` (seconds) over the earlier records of the same objective and device (scaled by the program
+    size for the XLA compilation); None without such records."""
+    same = [r for r in records if r.get("objective") == key["objective"] and r.get("device") == key["device"]
+            and not r.get("cache_hit") and r.get(field)]
+    if not same:
+        return None
+    if field == "compile_s" and size_mb:
+        return float(np.median([r[field] * size_mb / r["size_mb"] for r in same if r.get("size_mb")]))
+    return float(np.median([r[field] for r in same]))
+
+
+def _wait_with_progress(fn, desc: str, estimate: Optional[float]):
+    """fn() while a progress bar shows the elapsed time against the estimate (s; elapsed only if None) and the RAM
+    of the process. Returns (result, seconds)."""
+    try:
+        from resources import memory
+    except ImportError:
+        memory = lambda: {}
+    done = threading.Event()
+    estimate = estimate if estimate and estimate >= 1.0 else None
+    fmt = ("{desc}: {percentage:3.0f}% of estimate |{bar}| {elapsed} {postfix}" if estimate
+           else "{desc}: {elapsed} {postfix}")
+    bar = tqdm(total=estimate, desc=desc, bar_format=fmt, unit="s", leave=True)
+    t0 = time.perf_counter()
+
+    def tick():
+        while not done.wait(1.0):
+            el = time.perf_counter() - t0
+            bar.n = min(el, 0.99 * bar.total) if bar.total else el
+            m = memory()
+            left = "" if not bar.total else (f"~{(bar.total - el) / 60:.1f} min left of ~{bar.total / 60:.1f} min"
+                                             if el < bar.total else f"over the estimate of ~{bar.total / 60:.1f} min")
+            bar.set_postfix_str(", ".join(x for x in (left, f"RAM {m['rss']:.1f} GB" if m else "") if x))
+    th = threading.Thread(target=tick, daemon=True)
+    th.start()
+    try:
+        out = fn()
+    finally:
+        done.set()
+        th.join()
+        dt = time.perf_counter() - t0
+        if bar.total:
+            bar.n = bar.total
+        bar.set_postfix_str(f"done in {dt:.0f} s")
+        bar.close()
+    return out, dt
+
+
+def compile_with_progress(jitted, args: Tuple, key: Dict):
+    """Ahead-of-time compilation of jitted(*args) in its phases, with progress: tracing and lowering to StableHLO
+    (Python), XLA compilation (or loading from the persistent cache in jax_cache/), first evaluation. The phases cannot
+    report their own progress: the bars compare the elapsed time with the earlier compilations of the same objective
+    and device in output/compile_times.jsonl (scaled by the program size), and the run is appended there. key:
+    objective, device and the sizes of the program (segments, restarts, ...). Returns (compiled, first result)."""
+    records = []
+    if COMPILE_LOG.exists():
+        for line in COMPILE_LOG.read_text().splitlines():
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    lowered, t_lower = _wait_with_progress(lambda: jitted.lower(*args), "  1/3 tracing + lowering",
+                                           _compile_estimate(records, key, None, "lower_s"))
+    size_mb = len(lowered.as_text()) / 1e6
+    est = _compile_estimate(records, key, size_mb, "compile_s")
+    n_prev = sum(1 for r in records if r.get("objective") == key["objective"] and r.get("device") == key["device"])
+    print(f"      program {size_mb:.1f} MB of StableHLO; XLA compilation estimate "
+          + (f"~{est / 60:.1f} min (from {n_prev} earlier compilations, scaled by size)" if est else
+             "unavailable (first compilation of this objective on this device)"), flush=True)
+    hits = []
+    listener = lambda event, **kw: hits.append(event) if event == "/jax/compilation_cache/cache_hits" else None
+    jax.monitoring.register_event_listener(listener)
+    cache_log = _CacheLog()
+    loggers = [logging.getLogger(n) for n in ("jax._src.compiler", "jax._src.compilation_cache")]
+    levels = [lg.level for lg in loggers]
+    for lg in loggers:
+        lg.addHandler(cache_log)
+        lg.setLevel(logging.DEBUG)
+    try:
+        compiled, t_comp = _wait_with_progress(lowered.compile, "  2/3 XLA compilation", est)
+    finally:
+        jax.monitoring.unregister_event_listener(listener)
+        for lg, lv in zip(loggers, levels):
+            lg.removeHandler(cache_log)
+            lg.setLevel(lv)
+    hit = bool(hits)
+    print("      " + ("loaded from the persistent cache (jax_cache/)" if hit else "compiled (not in the persistent cache)"),
+          flush=True)
+    for msg in cache_log.messages:
+        if not hit or "hit" in msg.lower():
+            print(f"      jax cache: {msg}", flush=True)
+    first, t_first = _wait_with_progress(lambda: jax.block_until_ready(compiled(*args)), "  3/3 first evaluation",
+                                         _compile_estimate(records, key, None, "first_eval_s"))
+    rec = {"date": datetime.now().isoformat(timespec="seconds"), **key, "size_mb": round(size_mb, 2),
+           "lower_s": round(t_lower, 1), "compile_s": round(t_comp, 1), "first_eval_s": round(t_first, 1),
+           "cache_hit": hit}
+    try:
+        COMPILE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(COMPILE_LOG, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+    print(f"  ✓ ready in {t_lower + t_comp + t_first:.0f} s (tracing {t_lower:.0f} s, XLA "
+          f"{'cache load' if hit else 'compilation'} {t_comp:.0f} s, first evaluation {t_first:.0f} s)", flush=True)
+    return compiled, first
 
 def fit_params(trials: Sequence[CariTrial], base_params: HumanKinematicParams, ioc_cfg, model_cfg, data_cfg=None,
                callback: Optional[Callable[[int, Dict], None]] = None, segments: Optional[List] = None
@@ -560,13 +719,13 @@ def fit_params(trials: Sequence[CariTrial], base_params: HumanKinematicParams, i
     stopped_early, stop_iter = False, None
 
     t_start = time.perf_counter()
-    print(f"  compiling the {objective} objective ({n_seg} segments, {len(infer)} parameters, "
-          f"{ioc_cfg.restarts} parallel restarts)...", flush=True)
-    t_comp = time.perf_counter()
-    val, g = value_and_grad(theta, ioc.groups)
-    jax.block_until_ready((val, g))
-    dt_comp = time.perf_counter() - t_comp
-    print(f"  ✓ compilation finished in {dt_comp:.1f}s ({dt_comp / 60:.1f} min). Starting optimization across {ioc_cfg.max_iter} iterations...\n", flush=True)
+    print(f"  compiling the {objective} objective ({n_seg} segments in {len(ioc.groups)} hand groups, {len(infer)} "
+          f"parameters, {ioc_cfg.restarts} parallel restarts)...", flush=True)
+    key = {"objective": objective, "device": next(iter(theta.devices())).platform, "n_seg": n_seg,
+           "n_groups": len(ioc.groups), "restarts": int(ioc_cfg.restarts), "n_params": len(infer),
+           "T_fit": int(ioc_cfg.T_fit), "solve_iters": int(ioc_cfg.get("solve_iters", 8))}
+    value_and_grad, (val, g) = compile_with_progress(value_and_grad, (theta, ioc.groups), key)
+    print(f"  starting the optimization ({ioc_cfg.max_iter} iterations at most)\n", flush=True)
 
     val, g = np.array(val), np.array(g)
     loss_base = float(val[0])

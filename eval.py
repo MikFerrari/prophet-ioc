@@ -290,7 +290,7 @@ def main(cfg: DictConfig):
     print(f"weights: {weights_path or 'initial weights of config/model'}", flush=True)
     root = Path(cfg.eval.output_dir) if cfg.eval.output_dir else default_output_dir(weights_path)
     train_subjects, test_subjects = ck.split_subjects(cfg.data)
-    trials = ck.load_trials(cfg.data, test_subjects)
+    trials = ck.load_trials(cfg.data, test_subjects, role="test")
     tracker = Tracker(cfg.get("wandb"), "eval", root.name, OmegaConf.to_container(cfg, resolve=True))
     learned = {}
     if cfg.eval.get("baselines"):   # data-driven baselines, learned once from the training subjects' complete reaches
@@ -298,7 +298,7 @@ def main(cfg: DictConfig):
             print("WARNING: no data.test_subjects: the data-driven baselines are trained on the evaluated reaches")
         names = [str(b) for b in cfg.eval.baselines]
         options = OmegaConf.to_container(cfg.eval.get("baseline_options") or {}, resolve=True)
-        learned = ck.fit_baselines(names, ck.load_trials(cfg.data, train_subjects), options)
+        learned = ck.fit_baselines(names, ck.load_trials(cfg.data, train_subjects, role="baseline training"), options)
         print(f"data-driven baselines {', '.join(names)}: trained on the reaches of {', '.join(train_subjects)}")
     plot_keys = {str(t) for t in cfg.eval.plot_trials or []}
     overview, all_rows, curves = {}, [], {}

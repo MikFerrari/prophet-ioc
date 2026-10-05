@@ -16,6 +16,9 @@ instruction of every training subject is a demonstration (complete reach).
   so that 95 % of the wrist / elbow prediction errors of the training subjects fall in the 95 % ellipsoids
   (leave-one-subject-out among them; the value for a new person is the pooled one), and the coverage of the model
   covariance on the same errors is reported.
+Resources (ioc.resources, evaluation/resources.py): lower priority, a few cores left free and a memory watchdog that
+stops the run (exit code 137, with the reason) when its RAM exceeds ioc.resources.max_ram_gb (default 80 % of the
+physical RAM) or the system's available RAM falls below ioc.resources.min_available_gb, before the machine swaps.
 Results: output/train_<timestamp>/ with params.json (fitted weights, pred_noise per observed fraction, fit history),
 figures/ (convergence, parameters, open-loop error before / after the fit, example predictions) and
 output/latest_train; eval.py uses the latest run by default.
@@ -51,6 +54,7 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf
 
 import cari_kinematic as ck
+import resources
 from plot_utils import ioc_plots
 from tracking import Tracker
 from prophet_ioc.envs.human_kinematic_reaching import HumanKinematicReaching
@@ -73,11 +77,17 @@ def example_figure(trial, base, params, ratios, H, max_iter, path, tol=None, set
 @hydra.main(version_base=None, config_path="config", config_name="config")
 def main(cfg: DictConfig):
     os.chdir(ck.REPO_ROOT)  # relative paths (config, output/) refer to the repository root
+    # memory watchdog, priority and CPU affinity before the first JAX computation (XLA sizes its thread pools from
+    # the affinity): the run stops itself instead of pushing the machine into swap (evaluation/resources.py)
+    res = cfg.ioc.get("resources") or {}
+    resources.guard(max_ram_gb=res.get("max_ram_gb"), max_ram_fraction=float(res.get("max_ram_fraction", 0.8)),
+                    min_available_gb=float(res.get("min_available_gb", 3.0)), free_cpus=int(res.get("free_cpus", 2)),
+                    nice=int(res.get("nice", 10)))
     fit_device = ck.setup_jax(cfg.ioc.device)
     cpu = ck.setup_jax("cpu")
     root = Path(cfg.ioc.output_dir or Path("output") / f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     train_subjects, test_subjects = ck.split_subjects(cfg.data)
-    trials = ck.load_trials(cfg.data, train_subjects)
+    trials = ck.load_trials(cfg.data, train_subjects, role="training")
     base = ck.model_params(cfg.model)
     H, max_iter, tol = int(cfg.model.horizon), int(cfg.model.max_iter), ck.solver_tolerance(cfg.model)
     raw_vel = cfg.data.get("velocities") if hasattr(cfg.data, "get") else getattr(cfg.data, "velocities", None)
@@ -86,6 +96,10 @@ def main(cfg: DictConfig):
     vel_str = raw_vel if isinstance(raw_vel, str) else ", ".join(str(v) for v in raw_vel)
     print(f"=== IOC fit ({cfg.ioc.objective}) on {len(trials)} {vel_str} demonstrations of "
           f"{len(train_subjects)} subjects ({', '.join(train_subjects)}); held out: {', '.join(test_subjects)}",
+          flush=True)
+    starts = ck.window_starts(cfg.data)
+    print(f"    training windows from the observed fractions {', '.join(f'{r:.0%}' for r in starts)} of each reach to its "
+          f"end ({cfg.ioc.T_fit} steps): {len(trials)} reaches x {len(starts)} = {len(trials) * len(starts)} windows",
           flush=True)
 
     tracker = Tracker(cfg.get("wandb"), "train", root.name, OmegaConf.to_container(cfg, resolve=True))
@@ -129,6 +143,8 @@ def main(cfg: DictConfig):
         print(f"  {'parameter':22s} {'initial':>10s} {'fitted':>10s}")
         for k in fit_info["infer"]:
             print(f"  {k:22s} {ck.params_to_dict(base)[k]:10.3g} {ck.params_to_dict(params)[k]:10.3g}")
+        resources.release()   # the compiled objective (several GB of host RAM for the likelihood) is not needed any more
+        print(f"  after the fit: {resources.status()}", flush=True)
 
     noise = {}
     settings = ck.predictor_settings(cfg, info)   # observability and temperature of this fit
